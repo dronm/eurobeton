@@ -1,0 +1,34 @@
+I have this issue. I have successfull pings from my clients, then I got some other connections from not my clients,
+my server responses with 404, but after that there are no pings any more. Seems like somebody is sniffed my open port
+and started trying to check different endpoints. But why the server hangs after that? Might it be because it is 
+DDoSed?
+This is part of my log file:
+
+окт 11 12:39:25 melnichnaya ebeton[2496071]: time="2026-10-11T12:39:25+05:00" level=debug msg="Received: type:1, msg:{\"f\":\"ElkonProduction.Ping\",\"q\":\"ping\",\"p\":{>
+окт 11 12:39:25 melnichnaya ebeton[2496071]: time="2026-10-11T12:39:25+05:00" level=debug msg="Received: type:1, msg:{\"f\":\"ElkonProduction.Ping\",\"q\":\"ping\",\"p\":{>
+окт 11 12:39:45 melnichnaya ebeton[2496071]: time="2026-10-11T12:39:45+05:00" level=debug msg="Received: type:1, msg:{\"f\":\"ElkonProduction.Upload\",\"q\":\"\",\"p\":{\">
+окт 11 12:39:45 melnichnaya ebeton[2496071]: time="2026-10-11T12:39:45+05:00" level=debug msg="Received: type:1, msg:{\"f\":\"ElkonProduction.Upload\",\"q\":\"\",\"p\":{\">
+окт 11 12:39:45 melnichnaya ebeton[2496071]: time="2026-10-11T12:39:45+05:00" level=debug msg="Received: type:1, msg:{\"f\":\"ElkonProduction.Ping\",\"q\":\"ping\",\"p\":{>
+окт 11 12:46:54 melnichnaya ebeton[2496071]: time="2026-10-11T12:46:54+05:00" level=debug msg="Path: / | UA: Mozilla/5.0 (compatible; Infrawatch/1.0; +https://infrawat.ch/>
+окт 11 12:46:54 melnichnaya ebeton[2496071]: time="2026-10-11T12:46:54+05:00" level=debug msg="CorsMiddleware: origin: , baseURL: https://eurobeton.katren.org, IsSame: fal>
+окт 11 12:46:54 melnichnaya ebeton[2496071]: [GIN] 2026/10/11 - 12:46:54 | 404 |     135.664µs |    89.21.67.133 | GET      "/"
+окт 11 12:46:54 melnichnaya ebeton[2496071]: time="2026-10-11T12:46:54+05:00" level=debug msg="Path: /favicon.ico | UA: Mozilla/5.0 (compatible; Infrawatch/1.0; +https://i>
+окт 11 12:46:54 melnichnaya ebeton[2496071]: time="2026-10-11T12:46:54+05:00" level=debug msg="CorsMiddleware: origin: , baseURL: https://eurobeton.katren.org, IsSame: fal>
+окт 11 12:46:54 melnichnaya ebeton[2496071]: [GIN] 2026/10/11 - 12:46:54 | 404 |     129.203µs |    89.21.67.186 | GET      "/favicon.ico"
+окт 11 12:46:54 melnichnaya ebeton[2496071]: time="2026-10-11T12:46:54+05:00" level=debug msg="Path: /mcp/ | UA: Mozilla/5.0 (compatible; Infrawatch/1.0; +https://infrawat>
+окт 11 12:46:54 melnichnaya ebeton[2496071]: time="2026-10-11T12:46:54+05:00" level=debug msg="CorsMiddleware: origin: , baseURL: https://eurobeton.katren.org, IsSame: fal>
+окт 11 12:46:54 melnichnaya ebeton[2496071]: [GIN] 2026/10/11 - 12:46:54 | 404 |     137.182µs |  185.223.235.38 | GET      "/mcp/"
+окт 11 12:46:54 melnichnaya ebeton[2496071]: time="2026-10-11T12:46:54+05:00" level=debug msg="Path: / | UA: Mozilla/5.0 (compatible; Infrawatch/1.0; +https://infrawat.ch/>
+окт 11 12:46:54 melnichnaya ebeton[2496071]: time="2026-10-11T12:46:54+05:00" level=debug msg="CorsMiddleware: origin: , baseURL: https://eurobeton.katren.org, IsSame: fal>
+окт 11 12:46:54 melnichnaya ebeton[2496071]: [GIN] 2026/10/11 - 12:46:54 | 404 |      81.703µs |  193.176.31.230 | GET      "/"
+окт 11 12:46:54 melnichnaya ebeton[2496071]: time="2026-10-11T12:46:54+05:00" level=debug msg="Path: /api/mcp | UA: Mozilla/5.0 (compatible; Infrawatch/1.0; +https://infra>
+окт 11 12:46:54 melnichnaya ebeton[2496071]: time="2026-10-11T12:46:54+05:00" level=debug msg="CorsMiddleware: origin: , baseURL: https://eurobeton.katren.org, IsSame: fal>
+окт 11 12:46:54 melnichnaya ebeton[2496071]: [GIN] 2026/10/11 - 12:46:54 | 404 |      93.828µs |    89.21.67.161 | GET      "/api/mcp"
+окт 11 12:47:04 melnichnaya ebeton[2496071]: time="2026-10-11T12:47:04+05:00" level=debug msg="Path: /sse | UA: Mozilla/5.0 (compatible; Infrawatch/1.0; +https://infrawat.>
+окт 11 12:47:04 melnichnaya ebeton[2496071]: time="2026-10-11T12:47:04+05:00" level=debug msg="CorsMiddleware: origin: , baseURL: https://eurobeton.katren.org, IsSame: fal>
+окт 11 12:47:04 melnichnaya ebeton[2496071]: [GIN] 2026/10/11 - 12:47:04 | 404 |     111.477µs |  193.176.31.158 | GET      "/sse"
+окт 11 15:44:49 melnichnaya ebeton[2496071]: [GIN] 2026/10/11 - 15:44:49 | 404 |      44.512µs |   154.16.44.220 | GET      "/"
+окт 11 15:44:50 melnichnaya ebeton[2496071]: [GIN] 2026/10/11 - 15:44:50 | 404 |       1.352µs |     154.16.44.9 | GET      "/favicon.ico"
+окт 11 15:44:50 melnichnaya ebeton[2496071]: [GIN] 2026/10/11 - 15:44:50 | 404 |      37.489µs |    154.16.44.99 | GET      "/api/mcp"
+окт 11 15:44:50 melnichnaya ebeton[2496071]: [GIN] 2026/10/11 - 15:44:50 | 404 |      28.042µs |     2.57.17.180 | GET      "/"
+окт 11 15:44:50 melnichnaya ebeton[2496071]: [GIN] 2026/10/11 - 15:44:50 | 404 |       3.155µs |     2.57.17.116 | GET      "/mcp/"

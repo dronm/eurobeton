@@ -1,0 +1,33 @@
+{
+	"appId": "beton",
+	"baseURL": "http://localhost:5173",
+	"production": false,
+	"logLevel": "debug",
+	"debugQueries": true,
+	"reportErrors": true,
+	"httpServer": ":59000",
+	"isClusterMasterScript":"./is_master.sh",
+	"httpProgDir":"/home/andrey/www/htdocs/beton_new",
+	"phpDir":"php8.1",
+	"db":{
+		"primary":"postgresql://beton:159753@192.168.1.177:6432/beton_m",
+		"secondaries":{
+		}
+	},
+	"session":{
+		"encKey":"poegtrcu,w4ctgyuv231554fcv0t43VYBhw4gce5rcw18457f6qwe5fc7rfg16c27f5f4qw982ftg4ca65f4w",
+		"maxLifeTime":0,
+		"maxIdleTime":0
+	},
+	"publicStoreDir": "/home/andrey/www/htdocs/eurobeton/store",
+	"eventServer": {
+		"start": true,
+		"pauseInterval": 500
+	},
+	"wsServer": {
+		"start": true,
+		"cleanupInterval": 600000,
+		"address": ":1337"
+	}
+}
+

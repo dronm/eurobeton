@@ -1,0 +1,3337 @@
+--- /dev/null
++++ b/MIGRATION-ds-v4.md
+@@ -0,0 +1,58 @@
++# Migration to ds/v4
++
++The application now uses `github.com/dronm/ds/v4` throughout its database services. Database acquisition uses each operation's context, including the WebSocket method timeout and HTTP request timeout.
++
++## Dependencies
++
++| Module | Verified version/source |
++| --- | --- |
++| `ds/v4` | Supplied v4 source; commit `1d1425e7a834`, version `v4.0.0-20260612024620-1d1425e7a834` |
++| `gobizapp` | Supplied `gobizapp(1).zip`, which already uses `ds/v4` |
++| `crudifier/v2` | `v2.0.0-20260616013530-315cbf1baad3` |
++| `pgx/v5` | `v5.8.0`, as required by the supplied libraries |
++
++The application's existing local `replace` directives are retained. The ds replacement now targets `/home/andrey/go/ds/v4`. Ensure the local `gobizapp` folder contains the supplied v4-compatible code. Its filters require the five-argument `ModelToDBFilters` API from the newer `crudifier/v2`; update that local folder or remove its `replace` directive to use the pinned published version.
++
++The retained `gobizapp` version in `require` is overridden by its local replacement. Removing that replacement would select the old library, which is incompatible with this migration. Keep the replacement until a matching v4-compatible release is selected.
++
++## Application changes
++
++- Service fields, constructors and RPC initializers use `ds.Provider`.
++- Database helpers use `ds.Conn`, and row lookup checks use `ds.ErrNoRows`.
++- Acquisitions receive `ctx`; request cancellation and method timeouts can interrupt pool waits.
++- Startup uses the new `database.Initialize(ctx, storage, callback)` signature and a bounded startup context.
++- PostgreSQL sessions and LISTEN/NOTIFY retain their native pgx pool, obtained through v4's `PrimaryPool()` API.
++- Production Upload, Ping and Error operations reuse a single database lease for updates, mappings, logging and event notifications.
++- Material replacement uses an explicit transaction, retaining the previous batch's atomic delete/insert behavior.
++- Cache initialization acquires a connection before taking its map lock.
++- Failover shutdown cancels replay and waits for the worker. The notification listener releases its lease on cancellation before the provider closes.
++- Password email generation queries through `ds.Conn` because the existing notifier's SQL helper still accepts a native pgx connection.
++
++No database schema or configuration format changes are required.
++
++## Validation
++
++The application built successfully and passed `go test -race ./...` and `go vet ./...`, using temporary module replacements for the supplied libraries and the published versions listed above. Regression tests cover context cancellation, missing-user lookup, one-lease production operations with cold mapping caches, material commit/rollback, and failover cancellation. No live production database was used.
++
++The supplied ds core package tests pass. Its pgds test files reference obsolete internal types; those library test files were left unchanged.
++
++After applying the source and aligning the local dependencies, run:
++
++```bash
++go mod tidy
++go test -race ./...
++go build ./...
++```
++
++WebSocket write deadlines and the subscriber/event-lock blocking paths remain follow-up work in the hang investigation.
++
++## Commit message
++
++```text
++refactor(database): migrate eurobeton to ds/v4
++
++Propagate operation contexts to database acquisition and adapt services,
++startup and PostgreSQL pool access to the v4 provider interfaces.
++Reuse production upload leases, preserve atomic material replacement,
++and cancel background replay before closing the provider.
++```
+--- a/app/server.go
++++ b/app/server.go
+@@ -11,6 +11,7 @@
+ 	"github.com/gin-gonic/gin"
+ 
+ 	"github.com/dronm/crudifier/v2/metadata"
++	"github.com/dronm/ds/v4/pgds"
+ 	"github.com/dronm/session"
+ 
+ 	"github.com/dronm/gobizapp/database"
+@@ -70,9 +71,9 @@
+ 				"Order.to_bereg_insert": {},
+ 				"Order.to_bereg_update": {},
+ 				"Order.to_bereg_delete": {},
+-				"Distrib.Command": {},
+-			}
+-		}else {
++				"Distrib.Command":       {},
++			}
++		} else {
+ 			localEvents = map[string]struct{}{
+ 				"Distrib.Command": {},
+ 			}
+@@ -89,9 +90,9 @@
+ 				"VehicleSchedule.to_konkrid_insert": {},
+ 				"VehicleSchedule.to_konkrid_delete": {},
+ 				"VehicleSchedule.to_konkrid_update": {},
+-				"Distrib.Command": {},
+-			}
+-		}else {
++				"Distrib.Command":                   {},
++			}
++		} else {
+ 			localEvents = map[string]struct{}{
+ 				"Distrib.Command": {},
+ 			}
+@@ -104,11 +105,21 @@
+ 	gsrv.Configer = &config.Config
+ 
+ 	// database
+-	if err := database.Initialize(config.Config.DB, EvntSrv.OnNotification); err != nil {
++	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancelStartup()
++	if err := database.Initialize(startupCtx, config.Config.DB, EvntSrv.OnNotification); err != nil {
+ 		panic(fmt.Sprintf("database.Initialize() failed: %v", err))
+ 	}
+ 
+-	if err := sess.Initialize(config.Config.Session, database.DB.Primary.Pool, config.Config.LogLevel); err != nil {
++	pgProvider, ok := database.DB.(*pgds.Provider)
++	if !ok {
++		panic("database provider must support PostgreSQL sessions and notifications")
++	}
++	primaryPool, err := pgProvider.PrimaryPool()
++	if err != nil {
++		panic(fmt.Sprintf("pgProvider.PrimaryPool() failed: %v", err))
++	}
++	if err := sess.Initialize(config.Config.Session, primaryPool, config.Config.LogLevel); err != nil {
+ 		panic(fmt.Sprintf("session.Initialize() failed: %v", err))
+ 	}
+ 
+@@ -126,7 +137,7 @@
+ 		gsrv.EvHandler = WSSrv
+ 	}
+ 
+-	EvntSrv.DBPool = database.DB.Primary.Pool
++	EvntSrv.DBPool = primaryPool
+ 	EvntSrv.SocketServer = WSSrv
+ 
+ 	services.EvHandler = WSSrv
+@@ -140,7 +151,7 @@
+ 
+ 	// permissions
+ 	perm := services.NewPermissionService(database.DB)
+-	PermissionList, err = perm.ReadList(context.Background())
++	PermissionList, err = perm.ReadList(startupCtx)
+ 	if err != nil {
+ 		panic(fmt.Sprintf("perm.ReadList(): %v", err))
+ 	}
+--- a/beregmw/session.go
++++ b/beregmw/session.go
+@@ -63,7 +63,7 @@
+ 		var sessionAlreadyExists bool
+ 		if sessID != "" {
+ 			sessionAlreadyExists = true
+-			sessID = BeregSessionID(sessID)
++			sessID = BeregSessionID(c.Request.Context(), sessID)
+ 		}
+ 
+ 		c.Set("session_loader", func() (sess.Session, error) {
+@@ -96,23 +96,23 @@
+ }
+ 
+ // BeregSessionID loggs all errrors, returns corrected session ID or empty on error
+-func BeregSessionID(sessID string) string {
++func BeregSessionID(ctx context.Context, sessID string) string {
+ 	idParts := strings.Split(sessID, ":")
+ 	if len(idParts) < 2 {
+ 		return sessID // as is
+ 	}
+ 
+ 	// retrieve session ID from database by its pubkey idParts[0]
+-	poolConn, connID, err := database.DB.GetSecondary("")
++	poolConn, connID, err := database.DB.GetSecondary(ctx, "")
+ 	if err != nil {
+ 		logger.Logger.Errorf("GetSecondary(): %v", err)
+-		sessID = ""
++		return ""
+ 	}
+ 
+ 	defer database.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+ 
+-	if err := conn.QueryRow(context.Background(),
++	if err := conn.QueryRow(ctx,
+ 		`SELECT 
+ 			trim(session_id)
+ 		FROM logins 
+--- a/eventServer/pg.go
++++ b/eventServer/pg.go
+@@ -146,7 +146,7 @@
+ 				&api.ServiceContext{DB: database.DB, Session: s.sess},
+ 			)
+ 			if err != nil {
+-				logger.Logger.Errorf("EventServer api.CallMethod() %s.%s with params %v, failed: %v", srvMeth[0], srvMeth[1], params, err)	
++				logger.Logger.Errorf("EventServer api.CallMethod() %s.%s with params %v, failed: %v", srvMeth[0], srvMeth[1], params, err)
+ 			}
+ 			return
+ 		}
+@@ -232,6 +232,7 @@
+ 			for {
+ 				select {
+ 				case <-s.ctx.Done():
++					conn.Release()
+ 					return
+ 				case q = <-s.DBQuery:
+ 					logger.Logger.Debugf("EventSrv: query: %s", q)
+--- a/go.mod
++++ b/go.mod
+@@ -3,14 +3,15 @@
+ go 1.24.3
+ 
+ require (
+-	github.com/dronm/crudifier/v2 v2.0.0-20260316121314-df6c97d216a9
+-	github.com/dronm/ds v1.0.3
++	github.com/dronm/crudifier/v2 v2.0.0-20260616013530-315cbf1baad3
++	github.com/dronm/ds/v4 v4.0.0-20260612024620-1d1425e7a834
+ 	github.com/dronm/gobizapp v0.0.0-20260122081615-2650879fac06
+ 	github.com/dronm/session v0.0.0-20251220011348-444cd0bd6dad
+ 	github.com/gin-gonic/gin v1.11.0
+ 	github.com/gorilla/websocket v1.5.3
+-	github.com/jackc/pgx/v5 v5.7.6
++	github.com/jackc/pgx/v5 v5.8.0
+ 	github.com/mssola/user_agent v0.6.0
++	github.com/sirupsen/logrus v1.9.3
+ )
+ 
+ require (
+@@ -39,7 +40,6 @@
+ 	github.com/quic-go/quic-go v0.54.0 // indirect
+ 	github.com/richardlehane/mscfb v1.0.4 // indirect
+ 	github.com/richardlehane/msoleps v1.0.4 // indirect
+-	github.com/sirupsen/logrus v1.9.3 // indirect
+ 	github.com/tiendc/go-deepcopy v1.7.1 // indirect
+ 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
+ 	github.com/ugorji/go/codec v1.3.0 // indirect
+@@ -63,6 +63,6 @@
+ 
+ replace github.com/dronm/crudifier/v2 => /home/andrey/go/crudifier/v2
+ 
+-replace github.com/dronm/ds => /home/andrey/go/ds
++replace github.com/dronm/ds/v4 => /home/andrey/go/ds/v4
+ 
+ replace github.com/dronm/session => /home/andrey/go/session
+--- a/go.sum
++++ b/go.sum
+@@ -7,6 +7,10 @@
+ github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
+ github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
++github.com/dronm/crudifier/v2 v2.0.0-20260616013530-315cbf1baad3 h1:AgxJHAYj3ik+0w4zEyS9Kicp3HjN2RVQrUa1gRTfVNQ=
++github.com/dronm/crudifier/v2 v2.0.0-20260616013530-315cbf1baad3/go.mod h1:PRWK/Qb48SVqYKUpdPuSnBfqs20YpVTU2bQTrm6PmOM=
++github.com/dronm/session v0.0.0-20251220011348-444cd0bd6dad h1:p8P1yuEqZ/GgB0obsWjKSSTNXs3CctrynaLUv0RKJRs=
++github.com/dronm/session v0.0.0-20251220011348-444cd0bd6dad/go.mod h1:zLdV/6BUNsOE1k4a4+zRSjp4R3QVCp7DZj1HPVnVe2A=
+ github.com/gabriel-vasile/mimetype v1.4.8 h1:FfZ3gj38NjllZIeJAmMhr+qKL8Wu+nOoI3GqacKw1NM=
+ github.com/gabriel-vasile/mimetype v1.4.8/go.mod h1:ByKUIKGjh1ODkGM1asKUbQZOLGrPjydw3hYPU2YU9t8=
+ github.com/gin-contrib/sse v1.1.0 h1:n0w2GMuUpWDVp7qSpvze6fAu9iRxJY4Hmj6AmBOU05w=
+@@ -34,8 +38,8 @@
+ github.com/jackc/pgpassfile v1.0.0/go.mod h1:CEx0iS5ambNFdcRtxPj5JhEz+xB6uRky5eyVu/W2HEg=
+ github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 h1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=
+ github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761/go.mod h1:5TJZWKEWniPve33vlWYSoGYefn3gLQRzjfDlhSJ9ZKM=
+-github.com/jackc/pgx/v5 v5.7.6 h1:rWQc5FwZSPX58r1OQmkuaNicxdmExaEz5A2DO2hUuTk=
+-github.com/jackc/pgx/v5 v5.7.6/go.mod h1:aruU7o91Tc2q2cFp5h4uP3f6ztExVpyVv88Xl/8Vl8M=
++github.com/jackc/pgx/v5 v5.8.0 h1:TYPDoleBBme0xGSAX3/+NujXXtpZn9HBONkQC7IEZSo=
++github.com/jackc/pgx/v5 v5.8.0/go.mod h1:QVeDInX2m9VyzvNeiCJVjCkNFqzsNb43204HshNSZKw=
+ github.com/jackc/puddle/v2 v2.2.2 h1:PR8nw+E/1w0GLuRFSmiioY6UooMp6KJv0/61nB7icHo=
+ github.com/jackc/puddle/v2 v2.2.2/go.mod h1:vriiEXHvEE654aYKXXjOvZM39qJ0q+azkZFrfEOc3H4=
+ github.com/joho/godotenv v1.5.1 h1:7eLL/+HRGLY0ldzfGMeQkb7vMd0as4CfYvUVzLqw0N0=
+--- a/main.go
++++ b/main.go
+@@ -8,8 +8,8 @@
+ 	"syscall"
+ 	"time"
+ 
++	"github.com/dronm/gobizapp/database"
+ 	"github.com/dronm/gobizapp/logger"
+-	"github.com/dronm/gobizapp/database"
+ 
+ 	"github.com/dronm/eurobeton/app"
+ 	"github.com/dronm/eurobeton/config"
+@@ -32,6 +32,11 @@
+ 	}
+ 
+ 	srv := app.InitApp(iniFile)
++	defer func() {
++		if err := database.Close(); err != nil {
++			logger.Logger.Errorf("database.Close(): %v", err)
++		}
++	}()
+ 
+ 	services.ProgAbout.Name = "eurobeton"
+ 	services.ProgAbout.Author.Name = "Andrey Mikhalevich"
+@@ -80,6 +85,8 @@
+ 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(config.Config.AppShutdownTimeout)*time.Second)
+ 	defer cancel()
+ 
++	services.ElkonFailoverSrv.Shutdown(ctx)
++
+ 	app.EvntSrv.Shutdown(ctx)
+ 
+ 	if config.Config.WSServer.Start {
+--- a/models/user.go
++++ b/models/user.go
+@@ -6,7 +6,7 @@
+ )
+ 
+ const (
+-	userRelation         = "users"
++	userRelation        = "users"
+ 	userProfileRelation = "users_profile"
+ )
+ 
+@@ -27,7 +27,7 @@
+ }
+ 
+ func (m User) CollectionAgg() any {
+-	return &gmodels.TotCount{0}
++	return &gmodels.TotCount{}
+ }
+ 
+ type UserKey struct {
+--- a/services/carTracking.go
++++ b/services/carTracking.go
+@@ -4,22 +4,22 @@
+ 	"context"
+ 	"fmt"
+ 
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/eurobeton/models"
+ 	"github.com/dronm/session"
+ )
+ 
+ type CarTrackingService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ 	QueryID string
+ }
+ 
+-func NewCarTrackingService(db *pgds.PgProvider, sess session.Session) *CarTrackingService {
++func NewCarTrackingService(db ds.Provider, sess session.Session) *CarTrackingService {
+ 	return &CarTrackingService{DB: db, Session: sess}
+ }
+ 
+-func (s *CarTrackingService) SetDB(db *pgds.PgProvider) {
++func (s *CarTrackingService) SetDB(db ds.Provider) {
+ 	s.DB = db
+ }
+ 
+@@ -32,14 +32,14 @@
+ }
+ 
+ func (s *CarTrackingService) ToKonkrid(ctx context.Context, model models.CarTrackingKey) error {
+-	poolConn, connID, err := s.DB.GetPrimary()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 	if err != nil {
+-		return fmt.Errorf("GetPrimary(): %v", err)
++		return fmt.Errorf("GetPrimary(): %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+ 
+-	if _, err := conn.Exec(context.Background(),
++	if _, err := conn.Exec(ctx,
+ 		`INSERT INTO
+ 			public.car_tracking
+ 		SELECT
+--- a/services/cementSilo.go
++++ b/services/cementSilo.go
+@@ -11,7 +11,7 @@
+ 	crud "github.com/dronm/crudifier/v2"
+ 	fields "github.com/dronm/crudifier/v2/fields"
+ 	crudTypes "github.com/dronm/crudifier/v2/types"
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/session"
+ 
+ 	gmodels "github.com/dronm/gobizapp/models"
+@@ -28,12 +28,12 @@
+ 
+ // CementSiloService is a service for CementSilo database object.
+ type CementSiloService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ }
+ 
+ // NewCementSiloService is a service constructor.
+-func NewCementSiloService(db *pgds.PgProvider, sess session.Session) *CementSiloService {
++func NewCementSiloService(db ds.Provider, sess session.Session) *CementSiloService {
+ 	return &CementSiloService{DB: db, Session: sess}
+ }
+ 
+@@ -90,81 +90,89 @@
+ 	return gsrv.FetchCollectionModel(ctx, s.DB, &models.CementSiloList{}, &gmodels.TotCount{}, params)
+ }
+ 
+-// MapToProduction returns cementSilo ID from production description for a particular production site ID.
++// MapToProduction returns a silo ID for a production site and external description.
+ func (s *CementSiloService) MapToProduction(ctx context.Context, productionSiteID int, productionDescr string) (int, error) {
+ 	key := fmt.Sprintf("%d%s", productionSiteID, productionDescr)
++	CementSiloMapToProductionList.mx.RLock()
++	id, ok := CementSiloMapToProductionList.idList[key]
++	CementSiloMapToProductionList.mx.RUnlock()
++	if ok {
++		return id, nil
++	}
+ 
+-	// Fast path: try read lock and return if present.
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
++	if err != nil {
++		return 0, fmt.Errorf("GetPrimary(): %w", err)
++	}
++	defer s.DB.Release(poolConn, connID)
++	return s.mapToProductionWithConn(ctx, poolConn.Conn(), productionSiteID, productionDescr)
++}
++
++func (s *CementSiloService) mapToProductionWithConn(ctx context.Context, conn ds.Conn, productionSiteID int, productionDescr string) (int, error) {
++	key := fmt.Sprintf("%d%s", productionSiteID, productionDescr)
+ 	CementSiloMapToProductionList.mx.RLock()
+-	if CementSiloMapToProductionList.idList != nil {
+-		if id, ok := CementSiloMapToProductionList.idList[key]; ok {
+-			CementSiloMapToProductionList.mx.RUnlock()
+-			return id, nil
+-		}
++	id, ok := CementSiloMapToProductionList.idList[key]
++	CementSiloMapToProductionList.mx.RUnlock()
++	if ok {
++		return id, nil
+ 	}
+-	CementSiloMapToProductionList.mx.RUnlock()
+ 
+-	// Slow path: acquire write lock, (re)initialize if needed, re-check, then return or error.
+ 	CementSiloMapToProductionList.mx.Lock()
+ 	defer CementSiloMapToProductionList.mx.Unlock()
+-
+ 	if CementSiloMapToProductionList.idList == nil {
+-		if err := s.InitMapToProductionList(ctx); err != nil {
++		if err := s.initMapToProductionListWithConn(ctx, conn); err != nil {
+ 			return 0, err
+ 		}
+ 	}
+ 	if id, ok := CementSiloMapToProductionList.idList[key]; ok {
+ 		return id, nil
+ 	}
+-
+ 	return 0, fmt.Errorf("map not found for descr: %s", productionDescr)
+ }
+ 
+ func (s *CementSiloService) MapToProductionChange(ctx context.Context) error {
+-	CementSiloMapToProductionList.mx.Lock()
+-	defer CementSiloMapToProductionList.mx.Unlock()
+ 	return s.InitMapToProductionList(ctx)
+ }
+ 
+-// InitMapToProductionList initializes cement silo map to productions list. Should be executed when
+-// not initialized and after
+ func (s *CementSiloService) InitMapToProductionList(ctx context.Context) error {
+-	// Caller is expected to call this while holding the write lock (MapToProductionChange does).
+-	// We still initialize the map here.
+-	CementSiloMapToProductionList.idList = make(map[string]int)
+-
+-	poolConn, connID, err := s.DB.GetPrimary()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 	if err != nil {
+-		return fmt.Errorf("GetPrimary(): %v", err)
++		return fmt.Errorf("GetPrimary(): %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+-	conn := poolConn.Conn()
+ 
++	CementSiloMapToProductionList.mx.Lock()
++	defer CementSiloMapToProductionList.mx.Unlock()
++	return s.initMapToProductionListWithConn(ctx, poolConn.Conn())
++}
++
++// The caller holds the map's write lock and owns the supplied connection.
++func (s *CementSiloService) initMapToProductionListWithConn(ctx context.Context, conn ds.Conn) error {
+ 	rows, err := conn.Query(ctx,
+-		`SELECT 
+-			id, 
+-			production_descr, 
+-			production_site_id 
++		`SELECT
++			id,
++			production_descr,
++			production_site_id
+ 		FROM cement_silos`,
+ 	)
+ 	if err != nil {
+-		return fmt.Errorf("Query(): %v", err)
++		return fmt.Errorf("Query(): %w", err)
+ 	}
+ 	defer rows.Close()
+ 
++	idList := make(map[string]int)
+ 	for rows.Next() {
+ 		cemSilo := models.CementSilo{}
+ 		if err := rows.Scan(&cemSilo.ID, &cemSilo.ProductionDescr, &cemSilo.ProductionSiteID); err != nil {
+-			return fmt.Errorf("Scan(): %v", err)
++			return fmt.Errorf("Scan(): %w", err)
+ 		}
+-		CementSiloMapToProductionList.idList[fmt.Sprintf("%d%s",
++		idList[fmt.Sprintf("%d%s",
+ 			cemSilo.ProductionSiteID.GetValue(), cemSilo.ProductionDescr.GetValue(),
+ 		)] = int(cemSilo.ID.GetValue())
+ 	}
+ 	if err := rows.Err(); err != nil {
+-		return fmt.Errorf("Err(): %v", err)
++		return fmt.Errorf("Err(): %w", err)
+ 	}
+-
++	CementSiloMapToProductionList.idList = idList
+ 	return nil
+ }
+-
+--- a/services/concreteTypeMapToProduction.go
++++ b/services/concreteTypeMapToProduction.go
+@@ -11,7 +11,7 @@
+ 	crud "github.com/dronm/crudifier/v2"
+ 	fields "github.com/dronm/crudifier/v2/fields"
+ 	crudTypes "github.com/dronm/crudifier/v2/types"
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	gmodels "github.com/dronm/gobizapp/models"
+ 	gsrv "github.com/dronm/gobizapp/services"
+ 	"github.com/dronm/session"
+@@ -27,12 +27,12 @@
+ 
+ // ConcreteTypeMapToProductionService is a service for ConcreteTypeMapToProduction database object.
+ type ConcreteTypeMapToProductionService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ }
+ 
+ // NewConcreteTypeMapToProductionService is a service constructor.
+-func NewConcreteTypeMapToProductionService(db *pgds.PgProvider, sess session.Session) *ConcreteTypeMapToProductionService {
++func NewConcreteTypeMapToProductionService(db ds.Provider, sess session.Session) *ConcreteTypeMapToProductionService {
+ 	return &ConcreteTypeMapToProductionService{DB: db, Session: sess}
+ }
+ 
+@@ -90,93 +90,91 @@
+ }
+ 
+ func (s *ConcreteTypeMapToProductionService) InitMapToProductionList(ctx context.Context) error {
+-	ConcreteTypeMapToProductionList.idList = make(map[string]int)
+-
+-	poolConn, connID, err := s.DB.GetPrimary()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 	if err != nil {
+-		return fmt.Errorf("GetPrimary(): %v", err)
++		return fmt.Errorf("GetPrimary(): %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+-	conn := poolConn.Conn()
+ 
++	ConcreteTypeMapToProductionList.mx.Lock()
++	defer ConcreteTypeMapToProductionList.mx.Unlock()
++	return s.initMapToProductionListWithConn(ctx, poolConn.Conn())
++}
++
++// The caller holds the map's write lock and owns the supplied connection.
++func (s *ConcreteTypeMapToProductionService) initMapToProductionListWithConn(ctx context.Context, conn ds.Conn) error {
+ 	rows, err := conn.Query(ctx,
+-		`SELECT 
+-			production_descr, 
+-			concrete_type_id 
++		`SELECT
++			production_descr,
++			concrete_type_id
+ 		FROM concrete_type_map_to_production
+ 		WHERE concrete_type_id IS NOT NULL AND production_descr IS NOT NULL`,
+ 	)
+ 	if err != nil {
+-		return fmt.Errorf("Query(): %v", err)
++		return fmt.Errorf("Query(): %w", err)
+ 	}
++	defer rows.Close()
++
++	idList := make(map[string]int)
+ 	for rows.Next() {
+ 		var productionDescr string
+ 		var concreteTypeID int
+ 		if err := rows.Scan(&productionDescr, &concreteTypeID); err != nil {
+-			return fmt.Errorf("Scan(): %v", err)
++			return fmt.Errorf("Scan(): %w", err)
+ 		}
+-		ConcreteTypeMapToProductionList.idList[productionDescr] = concreteTypeID
++		idList[productionDescr] = concreteTypeID
+ 	}
+ 	if err := rows.Err(); err != nil {
+-		return fmt.Errorf("Err(): %v", err)
++		return fmt.Errorf("Err(): %w", err)
+ 	}
+-
++	ConcreteTypeMapToProductionList.idList = idList
+ 	return nil
+ }
+ 
+ func (s *ConcreteTypeMapToProductionService) Change(ctx context.Context) error {
+-	ConcreteTypeMapToProductionList.mx.Lock()
+-	defer ConcreteTypeMapToProductionList.mx.Unlock()
+ 	return s.InitMapToProductionList(ctx)
+ }
+ 
+-// MapToProduction returns cementSilo ID from production description for a particular production site ID.
++// MapToProduction returns a concrete type ID for the external description.
+ func (s *ConcreteTypeMapToProductionService) MapToProduction(ctx context.Context, productionDescr string) (int, error) {
+-    // Fast path: try read lock
+-    ConcreteTypeMapToProductionList.mx.RLock()
+-    if ConcreteTypeMapToProductionList.idList != nil {
+-        if id, ok := ConcreteTypeMapToProductionList.idList[productionDescr]; ok {
+-            ConcreteTypeMapToProductionList.mx.RUnlock()
+-            return id, nil
+-        }
+-    }
+-    ConcreteTypeMapToProductionList.mx.RUnlock()
++	ConcreteTypeMapToProductionList.mx.RLock()
++	id, ok := ConcreteTypeMapToProductionList.idList[productionDescr]
++	ConcreteTypeMapToProductionList.mx.RUnlock()
++	if ok {
++		return id, nil
++	}
+ 
+-    // Need to insert / initialize -> take write lock
+-    ConcreteTypeMapToProductionList.mx.Lock()
+-    defer ConcreteTypeMapToProductionList.mx.Unlock()
+-
+-    // Initialize if map is nil
+-    if ConcreteTypeMapToProductionList.idList == nil {
+-        if err := s.InitMapToProductionList(ctx); err != nil {
+-            return 0, err
+-        }
+-    }
+-
+-    // Re-check (another goroutine may have inserted while we were acquiring the lock)
+-    if id, ok := ConcreteTypeMapToProductionList.idList[productionDescr]; ok {
+-        return id, nil
+-    }
+-
+-    // Not found → add new type (we hold the write lock while doing DB call to avoid duplicated DB inserts)
+-    poolConn, connID, err := s.DB.GetPrimary()
+-    if err != nil {
+-        return 0, fmt.Errorf("GetPrimary(): %v", err)
+-    }
+-    defer s.DB.Release(poolConn, connID)
+-    conn := poolConn.Conn()
+-
+-    var id int
+-    if err := conn.QueryRow(ctx, `SELECT material_fact_consumptions_add_concrete_type($1)`, productionDescr).Scan(&id); err != nil {
+-        return 0, fmt.Errorf("SELECT material_fact_consumptions_add_concrete_type: %v", err)
+-    }
+-
+-    // store into the map while still holding the write lock
+-    if ConcreteTypeMapToProductionList.idList == nil {
+-        ConcreteTypeMapToProductionList.idList = make(map[string]int)
+-    }
+-    ConcreteTypeMapToProductionList.idList[productionDescr] = id
+-
+-    return id, nil
++	// Acquire before locking so uploads that already own a lease can use the map.
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
++	if err != nil {
++		return 0, fmt.Errorf("GetPrimary(): %w", err)
++	}
++	defer s.DB.Release(poolConn, connID)
++	return s.mapToProductionWithConn(ctx, poolConn.Conn(), productionDescr)
+ }
+ 
++func (s *ConcreteTypeMapToProductionService) mapToProductionWithConn(ctx context.Context, conn ds.Conn, productionDescr string) (int, error) {
++	ConcreteTypeMapToProductionList.mx.RLock()
++	id, ok := ConcreteTypeMapToProductionList.idList[productionDescr]
++	ConcreteTypeMapToProductionList.mx.RUnlock()
++	if ok {
++		return id, nil
++	}
++
++	ConcreteTypeMapToProductionList.mx.Lock()
++	defer ConcreteTypeMapToProductionList.mx.Unlock()
++	if ConcreteTypeMapToProductionList.idList == nil {
++		if err := s.initMapToProductionListWithConn(ctx, conn); err != nil {
++			return 0, err
++		}
++	}
++	if id, ok := ConcreteTypeMapToProductionList.idList[productionDescr]; ok {
++		return id, nil
++	}
++
++	if err := conn.QueryRow(ctx, `SELECT material_fact_consumptions_add_concrete_type($1)`, productionDescr).Scan(&id); err != nil {
++		return 0, fmt.Errorf("SELECT material_fact_consumptions_add_concrete_type: %w", err)
++	}
++	ConcreteTypeMapToProductionList.idList[productionDescr] = id
++	return id, nil
++}
+--- /dev/null
++++ b/services/database_context_test.go
+@@ -0,0 +1,137 @@
++package services
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"testing"
++
++	"github.com/dronm/ds/v4"
++	"github.com/dronm/eurobeton/models"
++	"github.com/dronm/gobizapp/errs"
++)
++
++type requestContextProvider struct {
++	ds.Provider
++	ctx      context.Context
++	poolConn ds.PoolConn
++}
++
++func (p *requestContextProvider) GetPrimary(ctx context.Context) (ds.PoolConn, ds.ServerID, error) {
++	p.ctx = ctx
++	if err := ctx.Err(); err != nil {
++		return nil, "", err
++	}
++	return p.poolConn, "primary", nil
++}
++
++func (p *requestContextProvider) Release(conn ds.PoolConn, _ ds.ServerID) {
++	conn.Release()
++}
++
++func TestServiceDatabaseAcquisitionUsesRequestContext(t *testing.T) {
++	tests := []struct {
++		name string
++		run  func(context.Context, ds.Provider) error
++	}{
++		{"user password", func(ctx context.Context, db ds.Provider) error {
++			return NewUserService(db, nil).UpdatePwd(ctx, 1, "password")
++		}},
++		{"password recovery", func(ctx context.Context, db ds.Provider) error {
++			return NewUserService(db, nil).RecoverPassword(ctx, "user@example.com")
++		}},
++		{"order", func(ctx context.Context, db ds.Provider) error {
++			return NewOrderService(db, nil).ToKonkridUpsert(ctx, models.OrderKey{})
++		}},
++		{"shipment", func(ctx context.Context, db ds.Provider) error {
++			return NewShipmentService(db, nil).ToKonkridUpsert(ctx, models.ShipmentKey{})
++		}},
++		{"car tracking", func(ctx context.Context, db ds.Provider) error {
++			return NewCarTrackingService(db, nil).ToKonkrid(ctx, models.CarTrackingKey{})
++		}},
++		{"vehicle schedule", func(ctx context.Context, db ds.Provider) error {
++			return NewVehicleScheduleService(db, nil).ToKonkridDelete(ctx, models.VehicleScheduleKey{})
++		}},
++		{"distribution cleanup", func(ctx context.Context, db ds.Provider) error {
++			return NewDistribService(db, nil).CollectGarbage(ctx)
++		}},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			ctx, cancel := context.WithCancel(context.Background())
++			cancel()
++			db := &requestContextProvider{}
++			err := tt.run(ctx, db)
++			if db.ctx != ctx {
++				t.Fatal("database acquisition did not receive the request context")
++			}
++			if !errors.Is(err, context.Canceled) {
++				t.Fatalf("expected a cancellation error, got %v", err)
++			}
++		})
++	}
++}
++
++type missingUserConn struct {
++	ds.Conn
++	contexts []context.Context
++}
++
++func (c *missingUserConn) Prepare(ctx context.Context, _, _ string) (ds.PreparedStatement, error) {
++	c.contexts = append(c.contexts, ctx)
++	return nil, nil
++}
++
++func (c *missingUserConn) QueryRow(ctx context.Context, _ string, _ ...any) ds.Row {
++	c.contexts = append(c.contexts, ctx)
++	return missingUserRow{}
++}
++
++type missingUserRow struct{}
++
++func (missingUserRow) Scan(...any) error {
++	return ds.ErrNoRows
++}
++
++type serviceTestPoolConn struct {
++	ds.PoolConn
++	conn     ds.Conn
++	released bool
++}
++
++func (c *serviceTestPoolConn) Conn() ds.Conn {
++	return c.conn
++}
++
++func (c *serviceTestPoolConn) Release() {
++	c.released = true
++}
++
++func TestLoginHandlesDSNoRowsAndPropagatesContext(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	conn := &missingUserConn{}
++	poolConn := &serviceTestPoolConn{conn: conn}
++	db := &requestContextProvider{poolConn: poolConn}
++
++	result, err := NewUserService(db, nil).Login(ctx, UserLoginInf{}, models.User_login{})
++	var publicErr errs.PublicError
++	if result != nil || !errors.As(err, &publicErr) {
++		t.Fatalf("expected a public login error for ds.ErrNoRows, got result=%v, err=%v", result, err)
++	}
++	if publicErr.HTTPStatus() != http.StatusForbidden || publicErr.Code() != errs.UserCredIncorrect {
++		t.Fatalf("unexpected login error: status=%d, code=%v", publicErr.HTTPStatus(), publicErr.Code())
++	}
++	if db.ctx != ctx || len(conn.contexts) != 2 {
++		t.Fatal("login did not acquire, prepare, and query using the request context")
++	}
++	for _, queryCtx := range conn.contexts {
++		if queryCtx != ctx {
++			t.Fatal("login query discarded the request context")
++		}
++	}
++	if !poolConn.released {
++		t.Fatal("login did not release its connection after missing credentials")
++	}
++}
+--- a/services/distrib.go
++++ b/services/distrib.go
+@@ -5,10 +5,9 @@
+ 	"fmt"
+ 	"time"
+ 
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/gobizapp/logger"
+-	"github.com/jackc/pgx/v5"
+ 
+-	"github.com/dronm/ds/pgds"
+ 	"github.com/dronm/session"
+ )
+ 
+@@ -16,17 +15,17 @@
+ 
+ // DistribService is a service.
+ type DistribService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ 	QueryID string
+ }
+ 
+ // NewDistribService is a service constructor.
+-func NewDistribService(db *pgds.PgProvider, sess session.Session) *DistribService {
++func NewDistribService(db ds.Provider, sess session.Session) *DistribService {
+ 	return &DistribService{DB: db, Session: sess}
+ }
+ 
+-func (s *DistribService) SetDB(db *pgds.PgProvider) {
++func (s *DistribService) SetDB(db ds.Provider) {
+ 	s.DB = db
+ }
+ 
+@@ -45,20 +44,20 @@
+ 	// Check if client is connected to this server
+ 	logger.Logger.Debugf("DistribService: DistribService.Command() recipientSessionID:%s", recipientSessionID)
+ 
+-    if WSSrv == nil {
+-        logger.Logger.Errorf("DistribService.Command: WSSrv is nil")
+-        return fmt.Errorf("WSSrv is nil")
+-    }
++	if WSSrv == nil {
++		logger.Logger.Errorf("DistribService.Command: WSSrv is nil")
++		return fmt.Errorf("WSSrv is nil")
++	}
+ 
+-    if !WSSrv.HasClientID(recipientSessionID) {
+-        logger.Logger.Warnf("DistribService.Command: client session not found: %s (payload: %v)", recipientSessionID, payload)
+-        return fmt.Errorf("client session not found: %s", recipientSessionID)
+-    }
++	if !WSSrv.HasClientID(recipientSessionID) {
++		logger.Logger.Warnf("DistribService.Command: client session not found: %s (payload: %v)", recipientSessionID, payload)
++		return fmt.Errorf("client session not found: %s", recipientSessionID)
++	}
+ 
+-    if err := WSSrv.SendMessageToClientID(recipientSessionID, payload); err != nil {
+-        logger.Logger.Errorf("DistribService.Command WSSrv.SendMessageToClientID(): %v", err)
+-        return fmt.Errorf("DistribService.Command WSSrv.SendMessageToClientID(): %v", err)
+-    }
++	if err := WSSrv.SendMessageToClientID(recipientSessionID, payload); err != nil {
++		logger.Logger.Errorf("DistribService.Command WSSrv.SendMessageToClientID(): %v", err)
++		return fmt.Errorf("DistribService.Command WSSrv.SendMessageToClientID(): %v", err)
++	}
+ 
+ 	return nil
+ }
+@@ -67,9 +66,9 @@
+ func (s *DistribService) AddQuery(ctx context.Context, queryID, sessionID string) error {
+ 	logger.Logger.Debugf("DistribService: DistribService.AddQuery() queryID:%s, sessionID:%s", queryID, sessionID)
+ 
+-	poolConn, connID, err := s.DB.GetPrimary()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 	if err != nil {
+-		return fmt.Errorf("GetPrimary() failed: %v", err)
++		return fmt.Errorf("GetPrimary() failed: %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -93,9 +92,9 @@
+ func (s *DistribService) SessionID(ctx context.Context, queryID string) (string, error) {
+ 	logger.Logger.Debugf("DistribService: DistribService.SessionID() queryID:%s", queryID)
+ 
+-	poolConn, connID, err := s.DB.GetPrimary()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 	if err != nil {
+-		return "", fmt.Errorf("GetPrimary() failed: %v", err)
++		return "", fmt.Errorf("GetPrimary() failed: %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -120,9 +119,9 @@
+ }
+ 
+ func (s *DistribService) CollectGarbage(ctx context.Context) error {
+-	poolConn, connID, err := s.DB.GetPrimary()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 	if err != nil {
+-		return fmt.Errorf("GetPrimary() failed: %v", err)
++		return fmt.Errorf("GetPrimary() failed: %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -130,7 +129,7 @@
+ 	return s.CollectGarbageWithConn(ctx, conn)
+ }
+ 
+-func (s *DistribService) CollectGarbageWithConn(ctx context.Context, conn *pgx.Conn) error {
++func (s *DistribService) CollectGarbageWithConn(ctx context.Context, conn ds.Conn) error {
+ 	if _, err := conn.Exec(
+ 		ctx,
+ 		`DELETE 
+@@ -143,4 +142,3 @@
+ 
+ 	return nil
+ }
+-
+--- a/services/elkonFailover.go
++++ b/services/elkonFailover.go
+@@ -13,7 +13,7 @@
+ 	"github.com/dronm/eurobeton/config"
+ 	"github.com/dronm/eurobeton/models"
+ 
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/session"
+ 
+ 	"github.com/dronm/gobizapp/logger"
+@@ -25,28 +25,35 @@
+ }
+ 
+ type ElkonFailoverService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ 
+-	filename string
+-	mu       sync.Mutex
+-	interval time.Duration
+-	stopCh   chan struct{}
++	filename  string
++	mu        sync.Mutex
++	interval  time.Duration
++	workerCtx context.Context
++	cancel    context.CancelFunc
++	doneCh    chan struct{}
++	startOnce sync.Once
++	stopOnce  sync.Once
+ }
+ 
+ var ElkonFailoverSrv *ElkonFailoverService
+ 
+-func InitElkonFailoverService(db *pgds.PgProvider, sess session.Session) {
++func InitElkonFailoverService(db ds.Provider, sess session.Session) {
+ 	interval := config.Config.Elkon.FailoverCheckInterval
+ 	if interval == 0 {
+ 		interval = 60000
+ 	}
++	workerCtx, cancel := context.WithCancel(context.Background())
+ 	ElkonFailoverSrv = &ElkonFailoverService{
+-		DB:       db,
+-		Session:  sess,
+-		filename: "elkonFailover.dat",
+-		interval: time.Duration(interval) * time.Millisecond,
+-		stopCh:   make(chan struct{}),
++		DB:        db,
++		Session:   sess,
++		filename:  "elkonFailover.dat",
++		interval:  time.Duration(interval) * time.Millisecond,
++		workerCtx: workerCtx,
++		cancel:    cancel,
++		doneCh:    make(chan struct{}),
+ 	}
+ }
+ 
+@@ -72,32 +79,48 @@
+ }
+ 
+ func (f *ElkonFailoverService) Start() {
+-	go func() {
+-		ticker := time.NewTicker(f.interval)
+-		defer ticker.Stop()
++	f.startOnce.Do(func() {
++		go func() {
++			defer close(f.doneCh)
++			ticker := time.NewTicker(f.interval)
++			defer ticker.Stop()
+ 
+-		f.replay()
++			f.replay(f.workerCtx)
+ 
+-		for {
+-			select {
+-			case <-ticker.C:
+-				f.replay()
+-			case <-f.stopCh:
+-				return
++			for {
++				select {
++				case <-ticker.C:
++					f.replay(f.workerCtx)
++				case <-f.workerCtx.Done():
++					return
++				}
+ 			}
+-		}
+-	}()
+-	logger.Logger.Infof("started elkon failover service with interval: %v", f.interval)
++		}()
++		logger.Logger.Infof("started elkon failover service with interval: %v", f.interval)
++	})
+ }
+ 
+ func (f *ElkonFailoverService) Shutdown(ctx context.Context) {
+-	close(f.stopCh)
+-	logger.Logger.Info("ElkonFailoverService gracefully shutdown")
++	if f == nil {
++		return
++	}
++	f.stopOnce.Do(f.cancel)
++	// Mark an unstarted service done, preventing a later Start after shutdown.
++	f.startOnce.Do(func() { close(f.doneCh) })
++	select {
++	case <-f.doneCh:
++		logger.Logger.Info("ElkonFailoverService gracefully shutdown")
++	case <-ctx.Done():
++		logger.Logger.Errorf("ElkonFailoverService shutdown: %v", ctx.Err())
++	}
+ }
+ 
+-func (f *ElkonFailoverService) replay() {
++func (f *ElkonFailoverService) replay(workerCtx context.Context) {
+ 	f.mu.Lock()
+ 	defer f.mu.Unlock()
++	if workerCtx.Err() != nil {
++		return
++	}
+ 
+ 	file, err := os.Open(f.filename)
+ 	if errors.Is(err, os.ErrNotExist) {
+@@ -115,7 +138,7 @@
+ 		timeout = 120000
+ 	}
+ 
+-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Millisecond)
++	ctx, cancel := context.WithTimeout(workerCtx, time.Duration(timeout)*time.Millisecond)
+ 	defer cancel()
+ 
+ 	elkSrv := NewElkonProductionService(f.DB, f.Session)
+@@ -125,7 +148,7 @@
+ 	scanner := bufio.NewScanner(file)
+ 	for scanner.Scan() {
+ 		select {
+-		case <-f.stopCh:
++		case <-ctx.Done():
+ 			return
+ 		default:
+ 		}
+@@ -135,11 +158,22 @@
+ 			logger.Logger.Errorf("ElkonFailoverService: Unmarshal(): %v", err)
+ 			continue
+ 		}
++		if p.Packet == nil {
++			logger.Logger.Error("ElkonFailoverService: saved packet is missing")
++			return
++		}
+ 
+ 		if err := elkSrv.Upload(ctx, p.ProductionSiteID, *p.Packet); err != nil {
+ 			logger.Logger.Errorf("ElkonFailoverService.Upload(): %v", err)
+ 			return // leave file for retry
+ 		}
++	}
++	if err := scanner.Err(); err != nil {
++		logger.Logger.Errorf("ElkonFailoverService: reading saved packets: %v", err)
++		return
++	}
++	if ctx.Err() != nil {
++		return
+ 	}
+ 
+ 	logger.Logger.Debug("ElkonFailoverService: all packets processed, removing file")
+--- /dev/null
++++ b/services/elkonFailover_test.go
+@@ -0,0 +1,77 @@
++package services
++
++import (
++	"context"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/dronm/ds/v4"
++)
++
++type failoverWaitingProvider struct {
++	ds.Provider
++	started  chan struct{}
++	canceled chan struct{}
++}
++
++func (p *failoverWaitingProvider) GetPrimary(ctx context.Context) (ds.PoolConn, ds.ServerID, error) {
++	close(p.started)
++	<-ctx.Done()
++	close(p.canceled)
++	return nil, "", ctx.Err()
++}
++
++func TestElkonFailoverShutdownCancelsReplayAndWaits(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	_ = newProductionTestProvider(t, ctx) // initialize a test logger
++	p := &failoverWaitingProvider{started: make(chan struct{}), canceled: make(chan struct{})}
++	workerCtx, stop := context.WithCancel(context.Background())
++	f := &ElkonFailoverService{
++		DB: p, filename: t.TempDir() + "/failover.dat", interval: time.Hour,
++		workerCtx: workerCtx, cancel: stop, doneCh: make(chan struct{}),
++	}
++	if err := os.WriteFile(f.filename, []byte("{\"production_site_id\":3,\"packet\":[]}\n"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	f.Start()
++	select {
++	case <-p.started:
++	case <-ctx.Done():
++		t.Fatal("replay did not acquire a connection")
++	}
++	f.Shutdown(ctx)
++	select {
++	case <-p.canceled:
++	default:
++		t.Fatal("replay acquisition was not canceled")
++	}
++	select {
++	case <-f.doneCh:
++	default:
++		t.Fatal("shutdown returned before replay exited")
++	}
++	if _, err := os.Stat(f.filename); err != nil {
++		t.Fatalf("unfinished failover packet must survive shutdown: %v", err)
++	}
++	f.Shutdown(ctx) // repeat shutdown must not panic
++}
++
++func TestElkonFailoverShutdownBeforeStart(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	_ = newProductionTestProvider(t, ctx)
++	workerCtx, stop := context.WithCancel(context.Background())
++	f := &ElkonFailoverService{
++		interval: time.Hour, workerCtx: workerCtx, cancel: stop,
++		doneCh: make(chan struct{}),
++	}
++	f.Shutdown(ctx)
++	f.Start()
++	select {
++	case <-f.doneCh:
++	default:
++		t.Fatal("unstarted worker was not marked complete")
++	}
++}
+--- a/services/elkonProduction.go
++++ b/services/elkonProduction.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"net/http"
+ 	"reflect"
+@@ -10,15 +11,14 @@
+ 	"github.com/dronm/crudifier/v2/fields"
+ 	"github.com/dronm/eurobeton/models"
+ 
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/session"
+ 
+ 	"github.com/dronm/gobizapp/errs"
+ 	"github.com/dronm/gobizapp/logger"
+ 	"github.com/dronm/gobizapp/ws"
+ 
+-	"github.com/jackc/pgx/v5"
+-	"github.com/jackc/pgx/v5/pgxpool"
++	gsrv "github.com/dronm/gobizapp/services"
+ )
+ 
+ const defaultReglUserID = 1 // for failover
+@@ -96,18 +96,18 @@
+ )
+ 
+ type ElkonProductionService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ 	QueryID string
+ 
+ 	FromFailoverFile bool
+ }
+ 
+-func NewElkonProductionService(db *pgds.PgProvider, sess session.Session) *ElkonProductionService {
++func NewElkonProductionService(db ds.Provider, sess session.Session) *ElkonProductionService {
+ 	return &ElkonProductionService{DB: db, Session: sess}
+ }
+ 
+-func (s *ElkonProductionService) SetDB(db *pgds.PgProvider) {
++func (s *ElkonProductionService) SetDB(db ds.Provider) {
+ 	s.DB = db
+ }
+ 
+@@ -123,12 +123,15 @@
+ 
+ // AddElkonProductionSite adds or updates a site with the given ID and session ID.
+ func (s *ElkonProductionService) AddElkonProductionSite(ctx context.Context, siteID int, sessionID string) error {
+-	poolConn, connID, err := s.DB.GetPrimary()
+-	if err != nil {
+-		return fmt.Errorf("GetPrimary() failed: %v", err)
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
++	if err != nil {
++		return fmt.Errorf("GetPrimary(): %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+-	conn := poolConn.Conn()
++	return s.addElkonProductionSiteWithConn(ctx, poolConn.Conn(), siteID, sessionID)
++}
++
++func (s *ElkonProductionService) addElkonProductionSiteWithConn(ctx context.Context, conn ds.Conn, siteID int, sessionID string) error {
+ 	if _, err := conn.Exec(ctx,
+ 		`UPDATE production_sites SET
+ 		elkon_session_id = $2
+@@ -136,61 +139,47 @@
+ 		siteID,
+ 		sessionID,
+ 	); err != nil {
+-		return fmt.Errorf("conn.Exec(): %v", err)
+-	}
+-
++		return fmt.Errorf("conn.Exec(): %w", err)
++	}
+ 	return nil
+ }
+ 
+ func (s *ElkonProductionService) Ping(ctx context.Context, productionSiteID int, msg *string) error {
+-	s.AddElkonProductionSite(ctx, productionSiteID, s.Session.SessionID())
+-
+-	poolConn, connID, err := s.DB.GetPrimary()
+-	if err != nil {
+-		return fmt.Errorf("GetPrimary(): %v", err)
++	return s.writeElkonLog(ctx, productionSiteID, "pong", ElkonMsgTypePing, "ElkonLog.Ping")
++}
++
++// Error receives an error command from Elkon and records it for subscribers.
++func (s *ElkonProductionService) Error(ctx context.Context, productionSiteID int, msg string) error {
++	return s.writeElkonLog(ctx, productionSiteID, msg, ElkonMsgTypeErr, "ElkonLog.Insert")
++}
++
++func (s *ElkonProductionService) writeElkonLog(ctx context.Context, productionSiteID int, msg string, msgType ElkonMsgType, eventID string) error {
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
++	if err != nil {
++		return fmt.Errorf("GetPrimary(): %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+-	if _, err := conn.Exec(ctx,
+-		`SELECT elkon_log_upsert( ROW(NULL, NOW(), $1, $2, $3)::elkon_log )`,
+-		productionSiteID,
+-		"pong",
+-		ElkonMsgTypePing,
+-	); err != nil {
+-		return fmt.Errorf("INSERT(): %v", err)
+-	}
+-
+-	// if s.Session != nil {
+-	// 	_ = gsrv.EvHandler.PublishEvent(s.Session.SessionID(), "ElkonProduction.Ping", nil)
+-	// }
+-
+-	PublishEvent(ctx, s.Session, "ElkonLog.Ping", nil)
+-
+-	return nil
+-}
+-
+-// Error recieves 'error' command from Elkon. It issues ws query to the calling client.
+-func (s *ElkonProductionService) Error(ctx context.Context, productionSiteID int, msg string) error {
+-	s.AddElkonProductionSite(ctx, productionSiteID, s.Session.SessionID())
+-
+-	poolConn, connID, err := s.DB.GetPrimary()
+-	if err != nil {
+-		return fmt.Errorf("GetPrimary(): %v", err)
+-	}
+-	defer s.DB.Release(poolConn, connID)
+-	conn := poolConn.Conn()
++
++	var sessionID string
++	if s.Session != nil {
++		sessionID = s.Session.SessionID()
++		if err := s.addElkonProductionSiteWithConn(ctx, conn, productionSiteID, sessionID); err != nil {
++			return err
++		}
++	}
+ 	if _, err := conn.Exec(ctx,
+ 		`SELECT elkon_log_upsert( ROW(NULL, NOW(), $1, $2, $3)::elkon_log )`,
+ 		productionSiteID,
+ 		msg,
+-		ElkonMsgTypeErr,
++		msgType,
+ 	); err != nil {
+-		return fmt.Errorf("INSERT(): %v", err)
+-	}
+-
+-	PublishEvent(ctx, s.Session, "ElkonLog.Insert", nil)
++		return fmt.Errorf("elkon_log_upsert(): %w", err)
++	}
++	if err := gsrv.PublishEventWithConn(ctx, conn, sessionID, eventID, nil); err != nil {
++		return fmt.Errorf("PublishEventWithConn(): %w", err)
++	}
+ 	return nil
+-
+ }
+ 
+ // PublishResponse sends command as an event for all servers to return request to the client that initiated the command.
+@@ -202,7 +191,7 @@
+ 	distrServ := NewDistribService(s.DB, s.Session)
+ 	clientSessID, err := distrServ.SessionID(ctx, s.QueryID)
+ 	if err != nil {
+-		return fmt.Errorf("AddQuery(): %v", err)
++		return fmt.Errorf("AddQuery(): %w", err)
+ 	}
+ 
+ 	resp := &ws.SrvResponse{EventID: eventID, QueryID: s.QueryID, Payload: payload}
+@@ -220,6 +209,7 @@
+ 
+ 	return nil
+ }
++
+ // Get recieves 'get' command from Elkon. It issues ws query to the calling client.
+ func (s *ElkonProductionService) Get(ctx context.Context, productionSiteID int, paramValue any) error {
+ 	return s.PublishResponse(ctx, productionSiteID, "ElkonProduction.Get", paramValue)
+@@ -235,17 +225,17 @@
+ }
+ 
+ func (s *ElkonProductionService) Upload(ctx context.Context, productionSiteID int, msg models.ElkonProductionList) error {
+-	pool := s.DB.Primary.Pool
+-	conn, err := pool.Acquire(ctx)
+-	if err != nil {
+-		logger.Logger.Errorf("Acquire(): %v", err)
+-		return fmt.Errorf("Acquire(): %v", err)
+-	}
+-	defer conn.Release()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
++	if err != nil {
++		logger.Logger.Errorf("GetPrimary(): %v", err)
++		return s.uploadError(ctx, nil, productionSiteID, &msg, fmt.Errorf("GetPrimary(): %w", err))
++	}
++	defer s.DB.Release(poolConn, connID)
++	conn := poolConn.Conn()
+ 
+ 	if s.Session != nil {
+-		if err := s.AddElkonProductionSite(ctx, productionSiteID, s.Session.SessionID()); err != nil {
+-			return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("Acquire(): %v", err))
++		if err := s.addElkonProductionSiteWithConn(ctx, conn, productionSiteID, s.Session.SessionID()); err != nil {
++			return s.uploadError(ctx, conn, productionSiteID, &msg, fmt.Errorf("AddElkonProductionSite(): %w", err))
+ 		}
+ 	}
+ 
+@@ -254,10 +244,10 @@
+ 	if s.FromFailoverFile {
+ 		//static user
+ 		userID = defaultReglUserID
+-	}else{
++	} else {
+ 		userID, err = LoggedUserID(s.Session)
+ 		if err != nil {
+-			return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("LoggedUserID(): %v", err))
++			return s.uploadError(ctx, conn, productionSiteID, &msg, fmt.Errorf("LoggedUserID(): %w", err))
+ 		}
+ 	}
+ 	//?????
+@@ -265,15 +255,18 @@
+ 		userID = defaultReglUserID
+ 	}
+ 
+-	if _, err := conn.Conn().Prepare(ctx, "productionInsertQuery", productionInsertQuery); err != nil {
+-		return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("conn.Prepare() productionInsertQuery: %v", err))
+-	}
+-
+-	if _, err := conn.Conn().Prepare(ctx, "materialDeleteQuery", materialDeleteQuery); err != nil {
+-		return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("conn.Prepare() materialDeleteQuery: %v", err))
+-	}
+-	if _, err := conn.Conn().Prepare(ctx, "materialInsertQuery", materialInsertQuery); err != nil {
+-		return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("conn.Prepare() materialInsertQuery: %v", err))
++	productionStmt, err := conn.Prepare(ctx, "productionInsertQuery", productionInsertQuery)
++	if err != nil {
++		return s.uploadError(ctx, conn, productionSiteID, &msg, fmt.Errorf("conn.Prepare() productionInsertQuery: %w", err))
++	}
++
++	materialDeleteStmt, err := conn.Prepare(ctx, "materialDeleteQuery", materialDeleteQuery)
++	if err != nil {
++		return s.uploadError(ctx, conn, productionSiteID, &msg, fmt.Errorf("conn.Prepare() materialDeleteQuery: %w", err))
++	}
++	materialInsertStmt, err := conn.Prepare(ctx, "materialInsertQuery", materialInsertQuery)
++	if err != nil {
++		return s.uploadError(ctx, conn, productionSiteID, &msg, fmt.Errorf("conn.Prepare() materialInsertQuery: %w", err))
+ 	}
+ 
+ 	concrServ := NewConcreteTypeMapToProductionService(s.DB, s.Session)
+@@ -291,9 +284,9 @@
+ 
+ 		productionID := fmt.Sprintf("%d", prod.ID)
+ 
+-		concreteTypeID, err := concrServ.MapToProduction(ctx, prod.ConcreteDescr)
++		concreteTypeID, err := concrServ.mapToProductionWithConn(ctx, conn, prod.ConcreteDescr)
+ 		if err != nil {
+-			return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("concrServ.MapToProduction(): %v", err))
++			return s.uploadError(ctx, conn, productionSiteID, &msg, fmt.Errorf("concrServ.MapToProduction(): %w", err))
+ 		}
+ 
+ 		now := time.Now()
+@@ -310,7 +303,7 @@
+ 		var vehicleSchStateID *int
+ 		var shipmentID *int
+ 
+-		if err := conn.QueryRow(ctx, "productionInsertQuery",
++		if err := productionStmt.QueryRow(ctx,
+ 			productionSiteID, productionID,
+ 			elkonForBeregFormatDatePtr(prod.ProductionDtStart),
+ 			elkonForBeregFormatDatePtr(prod.ProductionDtEnd),
+@@ -320,26 +313,20 @@
+ 			concreteTypeID,
+ 			prod.ConcreteQuant,
+ 		).Scan(&vehicleID, &vehicleSchStateID, &shipmentID); err != nil {
+-			return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("productionInsertQuery Query(): %v", err))
++			return s.uploadError(ctx, conn, productionSiteID, &msg, fmt.Errorf("productionInsertQuery Query(): %w", err))
+ 		}
+ 
+ 		if prod.ProductionDtEnd == nil {
+ 			continue // production not closed - no farther actions
+ 		}
+ 
+-		batch := &pgx.Batch{}
+-
+-		// closed production - add materials
+-		batch.Queue("materialDeleteQuery",
+-			productionSiteID,
+-			productionID,
+-		)
++		materialArgs := make([][]any, 0, models.ElkonProductionMaxMaterialCount)
+ 
+ 		// add all materials to a batch
+ 		for matInd := range models.ElkonProductionMaxMaterialCount {
+ 			mat, err := GetMaterialValue(prod, matInd+1)
+ 			if err != nil {
+-				return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("GetMaterialValue(): %v", err))
++				return s.uploadError(ctx, conn, productionSiteID, &msg, fmt.Errorf("GetMaterialValue(): %w", err))
+ 			}
+ 
+ 			if mat.MatQuant == 0 && mat.MatQuantReq == 0 && mat.MatQuantCorrected == 0 {
+@@ -358,9 +345,9 @@
+ 			var cementSiloID *int // can be null in database
+ 			if mat.MatCement {
+ 				// need silo ID
+-				id, err := cementSiloServ.MapToProduction(ctx, productionSiteID, mat.MatDescr)
++				id, err := cementSiloServ.mapToProductionWithConn(ctx, conn, productionSiteID, mat.MatDescr)
+ 				if err != nil {
+-					return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("cementSiloServ.MapToProduction(): %v", err))
++					return s.uploadError(ctx, conn, productionSiteID, &msg, fmt.Errorf("cementSiloServ.MapToProduction(): %w", err))
+ 				}
+ 				cementSiloID = &id
+ 			}
+@@ -368,7 +355,7 @@
+ 			materialID, ok := materials[mat.MatDescr]
+ 			if !ok {
+ 				// retrieve material ID from database
+-				keys, err := matMapToProdServ.Upsert(ctx,
++				keys, err := matMapToProdServ.upsertWithConn(ctx, conn,
+ 					models.MaterialMapToProduction{
+ 						ProductionSiteID: fields.NewFieldIntVal(int64(productionSiteID)),
+ 						ProductionDescr:  fields.NewFieldTextVal(mat.MatDescr),
+@@ -376,15 +363,15 @@
+ 					*prod.ProductionDtEnd,
+ 				)
+ 				if err != nil {
+-					return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("matMapToProdServ.Upsert(): %v", err))
++					return s.uploadError(ctx, conn, productionSiteID, &msg, fmt.Errorf("matMapToProdServ.Upsert(): %w", err))
+ 				}
+ 				matIntf, ok := keys["id"]
+ 				if !ok {
+-					return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("Upsert() result has no id field"))
++					return s.uploadError(ctx, conn, productionSiteID, &msg, fmt.Errorf("Upsert() result has no id field"))
+ 				}
+ 				materialID, ok = matIntf.(int)
+ 				if !ok {
+-					return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("Upsert() result id cast to int error"))
++					return s.uploadError(ctx, conn, productionSiteID, &msg, fmt.Errorf("Upsert() result id cast to int error"))
+ 				}
+ 				materials[mat.MatDescr] = materialID
+ 			}
+@@ -407,7 +394,7 @@
+ 				production_id
+ 
+ 			*/
+-			batch.Queue("materialInsertQuery",
++			materialArgs = append(materialArgs, []any{
+ 				productionSiteID,
+ 				elkonForBeregFormatDate(time.Now()),
+ 				userID,
+@@ -424,21 +411,23 @@
+ 				mat.MatQuantReq,
+ 				cementSiloID,
+ 				productionID,
+-			)
+-		}
+-
+-		br := conn.SendBatch(ctx, batch)
+-		for i := 0; i < batch.Len(); i++ {
+-			_, err := br.Exec()
+-			if err != nil {
+-				if errClose := br.Close(); errClose != nil {
+-					return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("br.Close(): %v on error: %v", errClose, err))
++			})
++		}
++
++		// pgx batches ran the delete and inserts in one implicit transaction.
++		// Keep that atomic replacement while using the ds interfaces.
++		if err := ds.WithTx(ctx, conn, func(ctx context.Context, tx ds.Tx) error {
++			if _, err := tx.Exec(ctx, materialDeleteStmt.Name(), productionSiteID, productionID); err != nil {
++				return fmt.Errorf("materialDeleteQuery: %w", err)
++			}
++			for _, args := range materialArgs {
++				if _, err := tx.Exec(ctx, materialInsertStmt.Name(), args...); err != nil {
++					return fmt.Errorf("materialInsertQuery: %w", err)
+ 				}
+-				return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("pgx.BatchResults: %v", err))
+-			}
+-		}
+-		if err := br.Close(); err != nil {
+-			return s.UploadError(ctx, pool, productionSiteID, &msg, fmt.Errorf("br.Close(): %v", err))
++			}
++			return nil
++		}); err != nil {
++			return s.uploadError(ctx, conn, productionSiteID, &msg, err)
+ 		}
+ 	}
+ 
+@@ -451,9 +440,9 @@
+ // ElkonProductionSiteSessionID retrieves the session ID for the given site ID.
+ // Returns the session ID or error.
+ func (s *ElkonProductionService) ElkonProductionSiteSessionID(ctx context.Context, siteID int) (string, error) {
+-	poolConn, connID, err := s.DB.GetPrimary()
+-	if err != nil {
+-		return "", fmt.Errorf("GetPrimary() failed: %v", err)
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
++	if err != nil {
++		return "", fmt.Errorf("GetPrimary() failed: %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 
+@@ -464,10 +453,10 @@
+ 		FROM production_sites
+ 		WHERE id = $1`,
+ 		siteID,
+-	).Scan(&sessionID); err != nil && err == pgx.ErrNoRows {
++	).Scan(&sessionID); errors.Is(err, ds.ErrNoRows) {
+ 		return "", errElkonProdNotFound
+ 	} else if err != nil {
+-		return "", fmt.Errorf("conn.QueryRow(): %v", err)
++		return "", fmt.Errorf("conn.QueryRow(): %w", err)
+ 	}
+ 	return sessionID, nil
+ }
+@@ -589,40 +578,29 @@
+ 	return *bValPtr, nil
+ }
+ 
+-func (s *ElkonProductionService) UploadError(ctx context.Context, pool *pgxpool.Pool, productionSiteID int, msg *models.ElkonProductionList, err error) error {
+-	conn, errAc := pool.Acquire(ctx)
+-	defer conn.Release()
+-
+-	if errAc != nil {
+-		logger.Logger.Errorf("error inserting Acquire(): %v", errAc)
+-		return err
+-	}
+-
+-	if !s.FromFailoverFile {
+-
++// Reuse the upload lease even on error; acquiring another connection here can
++// deadlock an exhausted pool. Saving failover data does not depend on DB logging.
++func (s *ElkonProductionService) uploadError(ctx context.Context, conn ds.Conn, productionSiteID int, msg *models.ElkonProductionList, uploadErr error) error {
++	logMessage := uploadErr.Error()
++	if s.FromFailoverFile {
++		logMessage = "restoring from failover:" + logMessage
++	}
++	if conn != nil {
+ 		if _, errLog := conn.Exec(ctx,
+ 			`SELECT elkon_log_upsert( ROW(NULL, NOW(), $1, $2, $3)::elkon_log )`,
+ 			productionSiteID,
+-			err.Error(),
+-			ElkonMsgTypeErr,
+-		); err != nil {
+-			logger.Logger.Errorf("error inserting error: %v", errLog)
+-		}
+-		if saveErr := ElkonFailoverSrv.Save(&ElkonPacket{ProductionSiteID: productionSiteID, Packet: msg}); saveErr != nil {
+-			logger.Logger.Errorf("ElkonFailoverSrv.Save(): %v", saveErr)
+-		}
+-	} else {
+-		if _, errLog := conn.Exec(ctx,
+-			`SELECT elkon_log_upsert( ROW(NULL, NOW(), $1, $2, $3)::elkon_log )`,
+-			productionSiteID,
+-			"restoring from failover:"+err.Error(),
++			logMessage,
+ 			ElkonMsgTypeErr,
+ 		); errLog != nil {
+ 			logger.Logger.Errorf("error inserting error: %v", errLog)
+ 		}
+ 	}
+-
+-	return err
++	if !s.FromFailoverFile {
++		if saveErr := ElkonFailoverSrv.Save(&ElkonPacket{ProductionSiteID: productionSiteID, Packet: msg}); saveErr != nil {
++			logger.Logger.Errorf("ElkonFailoverSrv.Save(): %v", saveErr)
++		}
++	}
++	return uploadErr
+ }
+ 
+ func elkonForBeregFormatDate(tm time.Time) string {
+--- a/services/elkonProductionCmd.go
++++ b/services/elkonProductionCmd.go
+@@ -6,22 +6,22 @@
+ 
+ 	"github.com/dronm/eurobeton/models"
+ 
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/gobizapp/logger"
+ 	"github.com/dronm/session"
+ )
+ 
+ type ElkonProductionCmdService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ 	QueryID string
+ }
+ 
+-func NewElkonProductionCmdService(db *pgds.PgProvider, sess session.Session) *ElkonProductionCmdService {
++func NewElkonProductionCmdService(db ds.Provider, sess session.Session) *ElkonProductionCmdService {
+ 	return &ElkonProductionCmdService{DB: db, Session: sess}
+ }
+ 
+-func (s *ElkonProductionCmdService) SetDB(db *pgds.PgProvider) {
++func (s *ElkonProductionCmdService) SetDB(db ds.Provider) {
+ 	s.DB = db
+ }
+ 
+--- /dev/null
++++ b/services/elkonProduction_test.go
+@@ -0,0 +1,329 @@
++package services
++
++import (
++	"context"
++	"errors"
++	"reflect"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/dronm/crudifier/v2/fields"
++	"github.com/dronm/ds/v4"
++	"github.com/dronm/eurobeton/models"
++	"github.com/dronm/gobizapp/logger"
++	"github.com/dronm/session"
++	"github.com/sirupsen/logrus"
++)
++
++type productionTestSession struct {
++	session.Session
++}
++
++func (productionTestSession) SessionID() string { return "elkon-test" }
++func (productionTestSession) GetString(key string) string {
++	if key == "user_id" {
++		return "1"
++	}
++	return ""
++}
++
++type productionTestProvider struct {
++	ds.Provider
++	conn     *productionTestConn
++	ctx      context.Context
++	acquires int
++	releases int
++	acquire  func(context.Context) error
++}
++
++func (p *productionTestProvider) GetPrimary(ctx context.Context) (ds.PoolConn, ds.ServerID, error) {
++	p.acquires++
++	if ctx != p.ctx {
++		return nil, "", errors.New("acquisition lost caller context")
++	}
++	if p.acquire != nil {
++		if err := p.acquire(ctx); err != nil {
++			return nil, "", err
++		}
++	}
++	if p.acquires > 1 {
++		return nil, "", errors.New("second acquisition would exhaust this one-connection pool")
++	}
++	return &productionTestLease{p: p}, "primary", nil
++}
++
++func (p *productionTestProvider) Release(pc ds.PoolConn, _ ds.ServerID) { pc.Release() }
++
++type productionTestLease struct{ p *productionTestProvider }
++
++func (l *productionTestLease) Conn() ds.Conn { return l.p.conn }
++func (l *productionTestLease) Release()      { l.p.releases++ }
++
++type productionTestResult struct{}
++
++func (productionTestResult) RowsAffected() int64 { return 1 }
++
++type productionTestRow struct{ scan func(...any) error }
++
++func (r productionTestRow) Scan(dest ...any) error { return r.scan(dest...) }
++
++type productionTestRows struct {
++	scan func(...any) error
++	next bool
++}
++
++func (*productionTestRows) Close() error { return nil }
++func (*productionTestRows) Err() error   { return nil }
++func (r *productionTestRows) Next() bool {
++	next := r.next
++	r.next = false
++	return next
++}
++func (r *productionTestRows) Scan(dest ...any) error { return r.scan(dest...) }
++
++type productionTestConn struct {
++	ds.Conn
++	ctx          context.Context
++	commands     []string
++	materialArgs [][]any
++	failUpdate   error
++	failInsert   bool
++	committed    bool
++	rolledBack   bool
++}
++
++func (c *productionTestConn) record(ctx context.Context, sql string) error {
++	if ctx != c.ctx {
++		return errors.New("database call lost caller context")
++	}
++	c.commands = append(c.commands, sql)
++	return nil
++}
++
++func (c *productionTestConn) Exec(ctx context.Context, sql string, args ...any) (ds.ExecResult, error) {
++	if err := c.record(ctx, sql); err != nil {
++		return nil, err
++	}
++	if strings.HasPrefix(sql, "UPDATE production_sites") && c.failUpdate != nil {
++		return nil, c.failUpdate
++	}
++	if sql == "materialInsertQuery" {
++		c.materialArgs = append(c.materialArgs, args)
++		if c.failInsert {
++			return nil, errors.New("material insert failed")
++		}
++	}
++	return productionTestResult{}, nil
++}
++
++func (c *productionTestConn) Query(ctx context.Context, sql string, args ...any) (ds.Rows, error) {
++	if err := c.record(ctx, sql); err != nil {
++		return nil, err
++	}
++	if strings.Contains(sql, "FROM cement_silos") {
++		return &productionTestRows{next: true, scan: func(dest ...any) error {
++			*dest[0].(*fields.FieldInt) = fields.NewFieldIntVal(9)
++			*dest[1].(*fields.FieldText) = fields.NewFieldTextVal("Cement")
++			*dest[2].(*fields.FieldInt) = fields.NewFieldIntVal(3)
++			return nil
++		}}, nil
++	}
++	return &productionTestRows{}, nil
++}
++
++func (c *productionTestConn) QueryRow(ctx context.Context, sql string, args ...any) ds.Row {
++	err := c.record(ctx, sql)
++	return productionTestRow{scan: func(dest ...any) error {
++		if err != nil {
++			return err
++		}
++		if sql == "productionInsertQuery" {
++			for _, d := range dest {
++				*d.(**int) = nil
++			}
++			return nil
++		}
++		if strings.Contains(sql, "material_fact_consumptions_add_") {
++			*dest[0].(*int) = 42
++			return nil
++		}
++		return errors.New("unexpected row query: " + sql)
++	}}
++}
++
++func (c *productionTestConn) Prepare(ctx context.Context, name string, sql string) (ds.PreparedStatement, error) {
++	if err := c.record(ctx, "prepare:"+name); err != nil {
++		return nil, err
++	}
++	return productionTestStatement{conn: c, name: name}, nil
++}
++
++func (c *productionTestConn) Begin(ctx context.Context) (ds.Tx, error) {
++	if err := c.record(ctx, "begin"); err != nil {
++		return nil, err
++	}
++	return productionTestTx{productionTestConn: c}, nil
++}
++
++type productionTestStatement struct {
++	conn *productionTestConn
++	name string
++}
++
++func (s productionTestStatement) Name() string { return s.name }
++func (s productionTestStatement) Exec(ctx context.Context, args ...any) (ds.ExecResult, error) {
++	return s.conn.Exec(ctx, s.name, args...)
++}
++func (s productionTestStatement) Query(ctx context.Context, args ...any) (ds.Rows, error) {
++	return s.conn.Query(ctx, s.name, args...)
++}
++func (s productionTestStatement) QueryRow(ctx context.Context, args ...any) ds.Row {
++	return s.conn.QueryRow(ctx, s.name, args...)
++}
++
++type productionTestTx struct{ *productionTestConn }
++
++func (tx productionTestTx) Commit(ctx context.Context) error {
++	tx.committed = true
++	return tx.record(ctx, "commit")
++}
++func (tx productionTestTx) Rollback(ctx context.Context) error {
++	tx.rolledBack = true
++	return tx.record(ctx, "rollback")
++}
++
++func newProductionTestProvider(t *testing.T, ctx context.Context) *productionTestProvider {
++	t.Helper()
++	oldLogger := logger.Logger
++	logger.Logger = logrus.New()
++	t.Cleanup(func() { logger.Logger = oldLogger })
++	return &productionTestProvider{ctx: ctx, conn: &productionTestConn{ctx: ctx}}
++}
++
++func TestElkonPingUsesOneLeaseAndPropagatesUpdateError(t *testing.T) {
++	for _, fail := range []bool{false, true} {
++		t.Run(map[bool]string{false: "success", true: "failed site update"}[fail], func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++			defer cancel()
++			p := newProductionTestProvider(t, ctx)
++			if fail {
++				p.conn.failUpdate = errors.New("site update failed")
++			}
++			err := NewElkonProductionService(p, productionTestSession{}).Ping(ctx, 3, nil)
++			if fail && !errors.Is(err, p.conn.failUpdate) {
++				t.Fatalf("expected site update error, got %v", err)
++			}
++			if !fail && err != nil {
++				t.Fatal(err)
++			}
++			if p.acquires != 1 || p.releases != 1 {
++				t.Fatalf("leases: acquired %d, released %d", p.acquires, p.releases)
++			}
++			wantCommands := 3 // update, log, notify on the same connection
++			if fail {
++				wantCommands = 1
++			}
++			if len(p.conn.commands) != wantCommands {
++				t.Fatalf("unexpected commands: %v", p.conn.commands)
++			}
++		})
++	}
++}
++
++func TestElkonUploadUsesOneLeaseWithColdMappingsAndAtomicMaterials(t *testing.T) {
++	for _, fail := range []bool{false, true} {
++		t.Run(map[bool]string{false: "commit", true: "rollback"}[fail], func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++			defer cancel()
++			p := newProductionTestProvider(t, ctx)
++			p.conn.failInsert = fail
++			ConcreteTypeMapToProductionList.mx.Lock()
++			oldMap := ConcreteTypeMapToProductionList.idList
++			ConcreteTypeMapToProductionList.idList = nil
++			ConcreteTypeMapToProductionList.mx.Unlock()
++			CementSiloMapToProductionList.mx.Lock()
++			oldSiloMap := CementSiloMapToProductionList.idList
++			CementSiloMapToProductionList.idList = nil
++			CementSiloMapToProductionList.mx.Unlock()
++			t.Cleanup(func() {
++				ConcreteTypeMapToProductionList.mx.Lock()
++				ConcreteTypeMapToProductionList.idList = oldMap
++				ConcreteTypeMapToProductionList.mx.Unlock()
++				CementSiloMapToProductionList.mx.Lock()
++				CementSiloMapToProductionList.idList = oldSiloMap
++				CementSiloMapToProductionList.mx.Unlock()
++			})
++			oldFailover := ElkonFailoverSrv
++			ElkonFailoverSrv = &ElkonFailoverService{filename: t.TempDir() + "/failover.dat"}
++			t.Cleanup(func() { ElkonFailoverSrv = oldFailover })
++
++			now := time.Now()
++			msg := models.ElkonProductionList{{
++				ID: 58697, ProductionDtStart: &now, ProductionDtEnd: &now,
++				ConcreteDescr: "B25", ConcreteQuant: 2,
++				Mat1Descr: "Sand", Mat1Quant: 1200, Mat1QuantReq: 1300,
++				Mat2Descr: "Cement", Mat2Quant: 600, Mat2QuantReq: 650, Mat2Cement: true,
++			}}
++			err := NewElkonProductionService(p, productionTestSession{}).Upload(ctx, 3, msg)
++			if (err != nil) != fail {
++				t.Fatalf("error = %v, expected failure = %v", err, fail)
++			}
++			if p.acquires != 1 || p.releases != 1 {
++				t.Fatalf("leases: acquired %d, released %d", p.acquires, p.releases)
++			}
++			if p.conn.committed != !fail || p.conn.rolledBack != fail {
++				t.Fatalf("transaction state: committed %v, rolled back %v", p.conn.committed, p.conn.rolledBack)
++			}
++			wantInserts := 2
++			if fail {
++				wantInserts = 1
++			}
++			if len(p.conn.materialArgs) != wantInserts {
++				t.Fatalf("material inserts = %d", len(p.conn.materialArgs))
++			}
++			args := p.conn.materialArgs[0]
++			if args[12] != 1.2 || args[13] != 1.3 || args[15] != "58697" {
++				t.Fatalf("incorrect material quantities/production ID: %v", args)
++			}
++			if !fail && *p.conn.materialArgs[1][14].(*int) != 9 {
++				t.Fatalf("incorrect cement silo: %v", p.conn.materialArgs[1])
++			}
++			var txCommands []string
++			for _, cmd := range p.conn.commands {
++				if cmd == "begin" || cmd == "materialDeleteQuery" || cmd == "materialInsertQuery" || cmd == "commit" || cmd == "rollback" {
++					txCommands = append(txCommands, cmd)
++				}
++			}
++			last := "commit"
++			if fail {
++				last = "rollback"
++			}
++			want := []string{"begin", "materialDeleteQuery", "materialInsertQuery"}
++			if !fail {
++				want = append(want, "materialInsertQuery")
++			}
++			want = append(want, last)
++			if !reflect.DeepEqual(txCommands, want) {
++				t.Fatalf("transaction command order = %v, want %v", txCommands, want)
++			}
++		})
++	}
++}
++
++func TestElkonAcquisitionUsesRequestCancellation(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	p := newProductionTestProvider(t, ctx)
++	p.acquire = func(ctx context.Context) error {
++		<-ctx.Done() // model an exhausted pool waiting for a request cancellation
++		return ctx.Err()
++	}
++	err := NewElkonProductionService(p, productionTestSession{}).Ping(ctx, 3, nil)
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("expected cancellation, got %v", err)
++	}
++	if p.acquires != 1 || p.releases != 0 || len(p.conn.commands) != 0 {
++		t.Fatalf("unexpected activity after failed acquire: %+v", p)
++	}
++}
+--- a/services/event.go
++++ b/services/event.go
+@@ -5,7 +5,7 @@
+ 	"errors"
+ 	"fmt"
+ 
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/session"
+ )
+ 
+@@ -20,12 +20,12 @@
+ var EvHandler EventHandler
+ 
+ type EventService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ 	QueryID string
+ }
+ 
+-func (s *EventService) SetDB(db *pgds.PgProvider) {
++func (s *EventService) SetDB(db ds.Provider) {
+ 	s.DB = db
+ }
+ 
+@@ -37,7 +37,7 @@
+ 	s.QueryID = queryID
+ }
+ 
+-func NewEventService(db *pgds.PgProvider, sess session.Session) *EventService {
++func NewEventService(db ds.Provider, sess session.Session) *EventService {
+ 	return &EventService{DB: db, Session: sess}
+ }
+ 
+--- a/services/materialMapToProduction.go
++++ b/services/materialMapToProduction.go
+@@ -11,7 +11,7 @@
+ 	crud "github.com/dronm/crudifier/v2"
+ 	fields "github.com/dronm/crudifier/v2/fields"
+ 	crudTypes "github.com/dronm/crudifier/v2/types"
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/session"
+ 
+ 	gmodels "github.com/dronm/gobizapp/models"
+@@ -20,12 +20,12 @@
+ 
+ // MaterialMapToProductionService is a service for MaterialMapToProduction database object.
+ type MaterialMapToProductionService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ }
+ 
+ // NewMaterialMapToProductionService is a service constructor.
+-func NewMaterialMapToProductionService(db *pgds.PgProvider, sess session.Session) *MaterialMapToProductionService {
++func NewMaterialMapToProductionService(db ds.Provider, sess session.Session) *MaterialMapToProductionService {
+ 	return &MaterialMapToProductionService{DB: db, Session: sess}
+ }
+ 
+@@ -83,15 +83,15 @@
+ }
+ 
+ func (s *MaterialMapToProductionService) Upsert(ctx context.Context, model models.MaterialMapToProduction, productionEnd time.Time) (map[string]any, error) {
+-	var retFields map[string]any
+-
+-	poolConn, connID, err := s.DB.GetPrimary()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 	if err != nil {
+-		return retFields, fmt.Errorf("GetPrimary(): %v", err)
++		return nil, fmt.Errorf("GetPrimary(): %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+-	conn := poolConn.Conn()
++	return s.upsertWithConn(ctx, poolConn.Conn(), model, productionEnd)
++}
+ 
++func (s *MaterialMapToProductionService) upsertWithConn(ctx context.Context, conn ds.Conn, model models.MaterialMapToProduction, productionEnd time.Time) (map[string]any, error) {
+ 	var id int
+ 	if err := conn.QueryRow(ctx,
+ 		`SELECT material_fact_consumptions_add_material($1::int, $2::text, $3)`,
+@@ -99,12 +99,14 @@
+ 		model.ProductionDescr.GetValue(),
+ 		productionEnd,
+ 	).Scan(&id); err != nil {
+-		return retFields, fmt.Errorf("QueryRow(): %v", err)
++		return nil, fmt.Errorf("QueryRow(): %w", err)
+ 	}
+-	retFields = map[string]any{"id": id}
++	retFields := map[string]any{"id": id}
+ 
+ 	if s.Session != nil {
+-		PublishEvent(ctx, s.Session, "MaterialMapToProduction.Insert", retFields)
++		if err := gsrv.PublishEventWithConn(ctx, conn, s.Session.SessionID(), "MaterialMapToProduction.Insert", retFields); err != nil {
++			return nil, fmt.Errorf("PublishEventWithConn(): %w", err)
++		}
+ 	}
+ 
+ 	return retFields, nil
+--- a/services/messages.go
++++ b/services/messages.go
+@@ -1,6 +1,6 @@
+ package services
+ 
+-const(
+-	ER_USER_BANNED = "user is banned, access not allowed"
++const (
++	ER_USER_BANNED                = "user is banned, access not allowed"
+ 	ER_USER_CREDENTIALS_INCORRECT = "user name or password incorrect"
+ )
+--- a/services/notifications.go
++++ b/services/notifications.go
+@@ -1,13 +1,14 @@
+ package services
+ 
+ import (
++	"context"
+ 	"errors"
+ 	"fmt"
+ 	"strings"
+ 
+ 	"github.com/dronm/gobizapp/notif"
+ 
+-	"github.com/jackc/pgx/v5"
++	"github.com/dronm/ds/v4"
+ )
+ 
+ // Здесь собраны функции отправки различных сообщений
+@@ -42,10 +43,22 @@
+ 	return nil
+ }
+ 
+-func RecoverPasswordEmail(conn *pgx.Conn, userId int, url string, newPassword string) error {
+-	msg, err := notif.NewEmailMessageFromSQL(conn, "email_recover_pwd", nil, nil, []any{userId, url, newPassword})
++func RecoverPasswordEmail(ctx context.Context, conn ds.Conn, userId int, url string, newPassword string) error {
++	msg := &notif.EmailMessage{}
++	err := conn.QueryRow(ctx,
++		`SELECT from_addr, from_name, reply_name, sender_addr, to_addr, to_name, body, subject
++		FROM email_recover_pwd($1, $2, $3)`,
++		userId, url, newPassword,
++	).Scan(&msg.FromAddr, &msg.FromName, &msg.ReplyName, &msg.SenderAddr,
++		&msg.ToAddr, &msg.ToName, &msg.Body, &msg.Subject)
++	if errors.Is(err, ds.ErrNoRows) {
++		return errors.New(notif.ER_TEMPLATE_NOT_FOUND)
++	}
+ 	if err != nil {
+-		return fmt.Errorf("notif.NewEmailMessageFromSQL() failed: %v", err)
++		return fmt.Errorf("email_recover_pwd query failed: %w", err)
++	}
++	if msg.ToAddr == "" {
++		return errors.New(notif.ER_EMAIL_NO_TO_ADDR)
+ 	}
+ 
+ 	notifMsg := notif.NewNotifMessage("confirm", notif.PROV_EMAIL)
+@@ -58,4 +71,3 @@
+ 		*tel = "7" + *tel
+ 	}
+ }
+-
+--- a/services/order.go
++++ b/services/order.go
+@@ -5,22 +5,22 @@
+ 	"fmt"
+ 	"time"
+ 
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/eurobeton/models"
+ 	"github.com/dronm/session"
+ )
+ 
+ type OrderService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ 	QueryID string
+ }
+ 
+-func NewOrderService(db *pgds.PgProvider, sess session.Session) *OrderService {
++func NewOrderService(db ds.Provider, sess session.Session) *OrderService {
+ 	return &OrderService{DB: db, Session: sess}
+ }
+ 
+-func (s *OrderService) SetDB(db *pgds.PgProvider) {
++func (s *OrderService) SetDB(db ds.Provider) {
+ 	s.DB = db
+ }
+ 
+@@ -45,9 +45,9 @@
+ }
+ 
+ func (s *OrderService) ToBeregUpsert(ctx context.Context, model models.OrderKey) error {
+-	poolConn, connID, err := s.DB.GetPrimary()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 	if err != nil {
+-		return fmt.Errorf("GetPrimary(): %v", err)
++		return fmt.Errorf("GetPrimary(): %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -145,9 +145,9 @@
+ }
+ 
+ func (s *OrderService) ToKonkridUpsert(ctx context.Context, model models.OrderKey) error {
+-	poolConn, connID, err := s.DB.GetPrimary()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 	if err != nil {
+-		return fmt.Errorf("GetPrimary(): %v", err)
++		return fmt.Errorf("GetPrimary(): %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -228,9 +228,9 @@
+ }
+ 
+ func (s *OrderService) Delete(ctx context.Context, model models.Order) error {
+-	poolConn, connID, err := s.DB.GetPrimary()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 	if err != nil {
+-		return fmt.Errorf("GetPrimary(): %v", err)
++		return fmt.Errorf("GetPrimary(): %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+--- a/services/permission.go
++++ b/services/permission.go
+@@ -3,79 +3,76 @@
+ import (
+ 	"context"
+ 
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ )
+ 
+ const permReadQueryID = "permissions_read" //prepared query ID
+ 
+ type PermissionService struct {
+-	DB      *pgds.PgProvider
++	DB ds.Provider
+ }
+ 
+-func NewPermissionService(db *pgds.PgProvider) *PermissionService {
++func NewPermissionService(db ds.Provider) *PermissionService {
+ 	return &PermissionService{DB: db}
+ }
+-
+ 
+ func (s *PermissionService) ReadList(ctx context.Context) (map[string]struct{}, error) {
+ 	return map[string]struct{}{
+ 		"Constant.list.owner": {},
+-		"Constant.set.owner": {},
+-		"Constant.get.owner": {},
++		"Constant.set.owner":  {},
++		"Constant.get.owner":  {},
+ 
+-		"MainMenu.for_user.owner": {},
+-		"MainMenu.list.owner": {},
+-		"MainMenu.detail.owner": {},
+-		"MainMenu.del.owner": {},
+-		"MainMenu.add.owner": {},
+-		"MainMenu.update.owner": {},
+-		"MainMenu.move_up.owner": {},
++		"MainMenu.for_user.owner":  {},
++		"MainMenu.list.owner":      {},
++		"MainMenu.detail.owner":    {},
++		"MainMenu.del.owner":       {},
++		"MainMenu.add.owner":       {},
++		"MainMenu.update.owner":    {},
++		"MainMenu.move_up.owner":   {},
+ 		"MainMenu.move_down.owner": {},
+ 
+-
+-		"ElkonProduction.upload.owner": {},
+-		"ElkonProduction.log.owner": {},
++		"ElkonProduction.upload.owner":       {},
++		"ElkonProduction.log.owner":          {},
+ 		"ElkonProduction.fetch_config.owner": {},
+-		"ElkonProduction.get.owner": {},
+-		"ElkonProduction.error.owner": {},
+-		"ElkonProduction.ping.owner": {},
++		"ElkonProduction.get.owner":          {},
++		"ElkonProduction.error.owner":        {},
++		"ElkonProduction.ping.owner":         {},
+ 
+ 		"WS.Init.owner": {},
+ 	}, nil
+ 	/*
+-	funcName := "ReadList"
+-	poolConn, connID, err := s.DB.GetSecondary("")
+-	if err != nil {
+-		return fmt.Errorf("%s GetSecondary() failed: %v", funcName, err)
+-	}
+-	defer s.DB.Release(poolConn, connID)
+-	conn := poolConn.Conn()
++		funcName := "ReadList"
++		poolConn, connID, err := s.DB.GetSecondary(ctx, "")
++		if err != nil {
++			return fmt.Errorf("%s GetSecondary() failed: %w", funcName, err)
++		}
++		defer s.DB.Release(poolConn, connID)
++		conn := poolConn.Conn()
+ 
+-	permRow := models.Permission{}
+-	permFields, permIds, err := MakeStructRowFields(&permRow, "")
+-	if err != nil {
+-		return fmt.Errorf("%s MakeStructRowFields() failed: %v", funcName, err)
+-	}
+-	if _, err := conn.Prepare(context.Background(),
+-		PERM_READ_Q,
+-		fmt.Sprintf("SELECT %s FROM permissions", permIds)); err != nil {
+-		return fmt.Errorf("%s conn.Prepare() for PERM_READ_Q failed: %v", funcName, err)
+-	}
+-	
+-	rows, err := conn.Query(ctx, PERM_READ_Q)
+-	if err != nil {
+-		return fmt.Errorf("conn.Query() failed: %v", err)
+-	}
++		permRow := models.Permission{}
++		permFields, permIds, err := MakeStructRowFields(&permRow, "")
++		if err != nil {
++			return fmt.Errorf("%s MakeStructRowFields() failed: %v", funcName, err)
++		}
++		if _, err := conn.Prepare(ctx,
++			PERM_READ_Q,
++			fmt.Sprintf("SELECT %s FROM permissions", permIds)); err != nil {
++			return fmt.Errorf("%s conn.Prepare() for PERM_READ_Q failed: %v", funcName, err)
++		}
+ 
+-	for rows.Next() {
+-		if err := rows.Scan(permFields...); err != nil {
+-			return fmt.Errorf("pgx.Rows.Scan() failed: %v", err)
++		rows, err := conn.Query(ctx, PERM_READ_Q)
++		if err != nil {
++			return fmt.Errorf("conn.Query() failed: %v", err)
+ 		}
+-		PermissionList = append(PermissionList, permRow)
+-	}
+-	if err := rows.Err(); err != nil {
+-		return fmt.Errorf("pgx.Rows.Err() failed: %v", err)
+-	}
++
++		for rows.Next() {
++			if err := rows.Scan(permFields...); err != nil {
++				return fmt.Errorf("pgx.Rows.Scan() failed: %v", err)
++			}
++			PermissionList = append(PermissionList, permRow)
++		}
++		if err := rows.Err(); err != nil {
++			return fmt.Errorf("pgx.Rows.Err() failed: %v", err)
++		}
+ 	*/
+ }
+-
+--- a/services/production.go
++++ b/services/production.go
+@@ -7,7 +7,7 @@
+ 	crud "github.com/dronm/crudifier/v2"
+ 	fields "github.com/dronm/crudifier/v2/fields"
+ 	crudTypes "github.com/dronm/crudifier/v2/types"
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/eurobeton/models"
+ 	gmodels "github.com/dronm/gobizapp/models"
+ 	gsrv "github.com/dronm/gobizapp/services"
+@@ -16,12 +16,12 @@
+ 
+ // ProductionService is a service for Production database object.
+ type ProductionService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ }
+ 
+ // NewProductionService is a service constructor.
+-func NewProductionService(db *pgds.PgProvider, sess session.Session) *ProductionService {
++func NewProductionService(db ds.Provider, sess session.Session) *ProductionService {
+ 	return &ProductionService{DB: db, Session: sess}
+ }
+ 
+--- a/services/progAbout.go
++++ b/services/progAbout.go
+@@ -11,7 +11,7 @@
+ 
+ 	"github.com/dronm/gobizapp/logger"
+ 
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/session"
+ )
+ 
+@@ -19,30 +19,30 @@
+ var progAboutMx sync.Mutex
+ 
+ type ProgAboutService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ }
+ 
+-func NewProgAboutService(db *pgds.PgProvider, sess session.Session) *ProgAboutService {
++func NewProgAboutService(db ds.Provider, sess session.Session) *ProgAboutService {
+ 	return &ProgAboutService{DB: db, Session: sess}
+ }
+ 
+ func (s *ProgAboutService) Info(ctx context.Context, primaryConn string) (*models.ProgAbout, error) {
+ 	if ProgAbout.DB == nil {
+ 
+-		poolConn, connID, err := s.DB.GetSecondary("")
++		poolConn, connID, err := s.DB.GetSecondary(ctx, "")
+ 		if err != nil {
+-			return nil, fmt.Errorf("GetSecondary() failed: %v", err)
++			return nil, fmt.Errorf("GetSecondary() failed: %w", err)
+ 		}
+ 		defer s.DB.Release(poolConn, connID)
+ 		conn := poolConn.Conn()
+ 
+ 		var vers string
+-		if err := conn.QueryRow(ctx, 
++		if err := conn.QueryRow(ctx,
+ 			`SELECT
+ 				version(),
+ 				(SELECT updated_at FROM deploy_updates ORDER BY updated_at DESC LIMIT 1)`,
+-			).Scan(&vers, &ProgAbout.UpdatedAt); err != nil {
++		).Scan(&vers, &ProgAbout.UpdatedAt); err != nil {
+ 			return nil, fmt.Errorf("conn.QueryRow().Scan() for version information: %v", err)
+ 		}
+ 
+@@ -57,11 +57,11 @@
+ 		}
+ 
+ 		progAboutMx.Lock()
+-		ProgAbout.Backend.IP = ip;
++		ProgAbout.Backend.IP = ip
+ 
+-		ProgAbout.DB = &models.ProgAboutDB{ServerType: "Postgresql", 
++		ProgAbout.DB = &models.ProgAboutDB{ServerType: "Postgresql",
+ 			ServerVersion: vers,
+-			Migration: migVers,
++			Migration:     migVers,
+ 		}
+ 		progAboutMx.Unlock()
+ 	}
+--- a/services/shipment.go
++++ b/services/shipment.go
+@@ -5,22 +5,22 @@
+ 	"fmt"
+ 	"time"
+ 
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/eurobeton/models"
+ 	"github.com/dronm/session"
+ )
+ 
+ type ShipmentService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ 	QueryID string
+ }
+ 
+-func NewShipmentService(db *pgds.PgProvider, sess session.Session) *ShipmentService {
++func NewShipmentService(db ds.Provider, sess session.Session) *ShipmentService {
+ 	return &ShipmentService{DB: db, Session: sess}
+ }
+ 
+-func (s *ShipmentService) SetDB(db *pgds.PgProvider) {
++func (s *ShipmentService) SetDB(db ds.Provider) {
+ 	s.DB = db
+ }
+ 
+@@ -33,9 +33,9 @@
+ }
+ 
+ func (s *ShipmentService) ToKonkridUpsert(ctx context.Context, model models.ShipmentKey) error {
+-	poolConn, connID, err := s.DB.GetPrimary()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 	if err != nil {
+-		return fmt.Errorf("GetPrimary(): %v", err)
++		return fmt.Errorf("GetPrimary(): %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+--- a/services/user.go
++++ b/services/user.go
+@@ -8,26 +8,24 @@
+ 
+ 	crud "github.com/dronm/crudifier/v2"
+ 	fields "github.com/dronm/crudifier/v2/fields"
++	crudTypes "github.com/dronm/crudifier/v2/types"
++	"github.com/dronm/ds/v4"
++	gmodels "github.com/dronm/gobizapp/models"
+ 	gsrv "github.com/dronm/gobizapp/services"
+-	gmodels "github.com/dronm/gobizapp/models"
+-	crudTypes "github.com/dronm/crudifier/v2/types"
+-	"github.com/dronm/ds/pgds"
+ 	"github.com/dronm/session"
+ 
+ 	"github.com/dronm/gobizapp/errs"
+ 
+ 	"github.com/dronm/eurobeton/config"
+ 	"github.com/dronm/eurobeton/models"
+-
+-	"github.com/jackc/pgx/v5"
+ )
+ 
+ type UserService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ }
+ 
+-func NewUserService(db *pgds.PgProvider, sess session.Session) *UserService {
++func NewUserService(db ds.Provider, sess session.Session) *UserService {
+ 	return &UserService{DB: db, Session: sess}
+ }
+ 
+@@ -90,9 +88,9 @@
+ 		return fmt.Errorf("Session.Get() failed: %v", err)
+ 	}
+ 
+-	poolConn, connID, err := s.DB.GetPrimary()
+-	if err != nil {
+-		return fmt.Errorf("GetPrimary() failed: %v", err)
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
++	if err != nil {
++		return fmt.Errorf("GetPrimary() failed: %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -128,9 +126,9 @@
+ func (s *UserService) Login(ctx context.Context, userInf UserLoginInf, model models.User_login) (*UserLoginResponse, error) {
+ 	funcName := "Login"
+ 
+-	poolConn, connID, err := s.DB.GetPrimary()
+-	if err != nil {
+-		return nil, fmt.Errorf("%s GetPrimary() failed: %v", funcName, err)
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
++	if err != nil {
++		return nil, fmt.Errorf("%s GetPrimary() failed: %w", funcName, err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -141,7 +139,7 @@
+ 		return nil, fmt.Errorf("%s MakeStructRowFields() failed: %v", funcName, err)
+ 	}
+ 
+-	if _, err := conn.Prepare(context.Background(),
++	if _, err := conn.Prepare(ctx,
+ 		USER_LOGIN_Q,
+ 		fmt.Sprintf(`SELECT %s 
+ 			FROM users_login 
+@@ -151,8 +149,8 @@
+ 		return nil, fmt.Errorf("%s conn.Prepare() for USER_LOGIN_Q failed: %v", funcName, err)
+ 	}
+ 
+-	err = conn.QueryRow(context.Background(), USER_LOGIN_Q, model.Name, model.Pwd).Scan(userFields...)
+-	if err == pgx.ErrNoRows {
++	err = conn.QueryRow(ctx, USER_LOGIN_Q, model.Name, model.Pwd).Scan(userFields...)
++	if err == ds.ErrNoRows {
+ 		// no user with this name &&  pwd
+ 		return nil, errs.NewPublicError(http.StatusForbidden, errs.UserCredIncorrect)
+ 	} else if err != nil {
+@@ -203,9 +201,9 @@
+ }
+ 
+ func (s *UserService) UpdatePwd(ctx context.Context, userID int, pwd string) error {
+-	poolConn, connID, err := s.DB.GetPrimary()
+-	if err != nil {
+-		return fmt.Errorf("GetPrimary() failed: %v", err)
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
++	if err != nil {
++		return fmt.Errorf("GetPrimary() failed: %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -219,9 +217,9 @@
+ 
+ func (s *UserService) RecoverPassword(ctx context.Context, email string) error {
+ 	// check email exists
+-	poolConn, connID, err := s.DB.GetPrimary()
+-	if err != nil {
+-		return fmt.Errorf("GetPrimary() failed: %v", err)
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
++	if err != nil {
++		return fmt.Errorf("GetPrimary() failed: %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -230,14 +228,14 @@
+ 	if err := conn.QueryRow(ctx,
+ 		"SELECT id FROM users WHERE email = $1",
+ 		email,
+-	).Scan(&userID); err != nil && err != pgx.ErrNoRows {
++	).Scan(&userID); err != nil && err != ds.ErrNoRows {
+ 		return fmt.Errorf("conn.QueryRow() select from users failed: %v", err)
+-	} else if err != nil && err == pgx.ErrNoRows {
++	} else if err != nil && err == ds.ErrNoRows {
+ 		return errs.NewPublicError(http.StatusForbidden, errs.UserEmailNotFound)
+ 	}
+ 
+ 	newPassword := GenUserPassword()
+-	if err := RecoverPasswordEmail(conn, userID, config.Config.BaseURL, newPassword); err != nil {
++	if err := RecoverPasswordEmail(ctx, conn, userID, config.Config.BaseURL, newPassword); err != nil {
+ 		return fmt.Errorf("RecoverPasswordEmail() failed: %w", err)
+ 	}
+ 
+@@ -250,9 +248,9 @@
+ 
+ func (s *UserService) SetDefaultPassword(ctx context.Context, userID int) error {
+ 	// check email exists
+-	poolConn, connID, err := s.DB.GetPrimary()
+-	if err != nil {
+-		return fmt.Errorf("GetPrimary() failed: %v", err)
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
++	if err != nil {
++		return fmt.Errorf("GetPrimary() failed: %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -265,7 +263,6 @@
+ 	return nil
+ }
+ 
+-
+ func GenUserPassword() string {
+ 	return "123456"
+ }
+--- a/services/userLogin.go
++++ b/services/userLogin.go
+@@ -11,8 +11,8 @@
+ 	"time"
+ 
+ 	crud "github.com/dronm/crudifier/v2"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/session"
+-	"github.com/jackc/pgx/v5"
+ 
+ 	"github.com/dronm/gobizapp/logger"
+ 
+@@ -33,8 +33,8 @@
+ 	PUB_KEY_LEN = 15
+ )
+ 
+-func loginUser(ctx context.Context, sess session.Session, userInf UserLoginInf, conn *pgx.Conn, userRow *models.UserLogin) error {
+-	if err := prepareUserLoginSQL(conn); err != nil {
++func loginUser(ctx context.Context, sess session.Session, userInf UserLoginInf, conn ds.Conn, userRow *models.UserLogin) error {
++	if err := prepareUserLoginSQL(ctx, conn); err != nil {
+ 		return fmt.Errorf("sprepareUserLoginSQL() failed: %v", err)
+ 	}
+ 
+@@ -89,20 +89,20 @@
+ 				WHERE user_id = $1 AND ban_hash = $2`,
+ 				userRow.ID, deviceHash).Scan(&timeIn)
+ 
+-			if err != nil && err != pgx.ErrNoRows {
++			if err != nil && err != ds.ErrNoRows {
+ 				return fmt.Errorf("first select from login_devices_list failed: %v", err)
+ 			}
+ 
+ 			/*
+-				if err == pgx.ErrNoRows || date_time_in.GetIsNull() {
++				if err == ds.ErrNoRows || date_time_in.GetIsNull() {
+ 					//first login - ban!
+-					if _, err := conn.Exec(context.Background(),
++					if _, err := conn.Exec(ctx,
+ 						`INSERT INTO login_device_bans
+ 							(user_id, hash) VALUES ($1, $2) ON CONFLICT (user_id, hash) DO NOTHING`,
+ 						user_id, device_hash); err != nil {
+ 							return "", gobizap.NewPublicMethodError(response.RESP_ER_INTERNAL, fmt.Sprintf("doLoginUser first login ban pgx.Conn.Exec(): %v",err))
+ 					}
+-					if _, err := conn.Exec(context.Background(),
++					if _, err := conn.Exec(ctx,
+ 						`INSERT INTO logins
+ 							(date_time_in, date_time_out, ip, session_id, pub_key, user_id, headers, user_agent)
+ 							VALUES(now(), now(), $1, $2, NULL, $3, $4::json, $5::jsonb)`,
+@@ -118,7 +118,7 @@
+ 
+ 	err = conn.QueryRow(ctx, USER_LOGIN_PUB_KEY_Q, sessID, userRow.ID).Scan(&userRow.PubKey, &userRow.LoginID)
+ 
+-	if err == pgx.ErrNoRows {
++	if err == ds.ErrNoRows {
+ 		// no user login
+ 		userRow.PubKey, err = genPublicKey()
+ 		if err != nil {
+@@ -134,7 +134,7 @@
+ 
+ 		// fmt.Println("userIP:", userIP)
+ 		// fmt.Println("userPubKey:", userRow.PubKey)
+-		if err == pgx.ErrNoRows {
++		if err == ds.ErrNoRows {
+ 			// no user
+ 			if err = conn.QueryRow(ctx,
+ 				USER_LOGIN_INSERT_Q,
+@@ -169,15 +169,15 @@
+ 	return nil
+ }
+ 
+-func prepareUserLoginSQL(conn *pgx.Conn) error {
+-	if _, err := conn.Prepare(context.Background(), USER_LOGIN_PUB_KEY_Q,
++func prepareUserLoginSQL(ctx context.Context, conn ds.Conn) error {
++	if _, err := conn.Prepare(ctx, USER_LOGIN_PUB_KEY_Q,
+ 		`SELECT pub_key, id
+ 		FROM logins
+ 		WHERE session_id=$1 AND user_id=$2 AND date_time_out IS NULL`); err != nil {
+ 		return fmt.Errorf("USER_LOGIN_PUB_KEY_Q pgx.Conn.Prepare(): %v", err)
+ 	}
+ 
+-	if _, err := conn.Prepare(context.Background(),
++	if _, err := conn.Prepare(ctx,
+ 		USER_LOGIN_UPDATE_Q,
+ 		`UPDATE logins
+ 		SET
+@@ -201,7 +201,7 @@
+ 		return fmt.Errorf("USER_LOGIN_UPDATE_Q pgx.Conn.Prepare(): %v", err)
+ 	}
+ 
+-	if _, err := conn.Prepare(context.Background(),
++	if _, err := conn.Prepare(ctx,
+ 		USER_LOGIN_INSERT_Q,
+ 		`INSERT INTO logins
+ 		(date_time_in, ip, session_id, pub_key, user_id, user_agent, headers)
+--- a/services/utils.go
++++ b/services/utils.go
+@@ -11,16 +11,16 @@
+ 	"github.com/dronm/gobizapp/logger"
+ 	gsrv "github.com/dronm/gobizapp/services"
+ 
+-	"github.com/jackc/pgx/v5"
++	"github.com/dronm/ds/v4"
+ )
+ 
+ const defCollectionLimit = 5000
+ 
+ /*
+-func InsertModel(ctx context.Context, db *pgds.PgProvider, model crudTypes.DbModel) (map[string]any, error) {
+-	poolConn, connID, err := db.GetPrimary()
+-	if err != nil {
+-		return nil, fmt.Errorf("GetPrimary() failed: %v", err)
++func InsertModel(ctx context.Context, db ds.Provider, model crudTypes.DbModel) (map[string]any, error) {
++	poolConn, connID, err := db.GetPrimary(ctx)
++	if err != nil {
++		return nil, fmt.Errorf("GetPrimary() failed: %w", err)
+ 	}
+ 	defer db.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -30,7 +30,7 @@
+ 
+ // InsertModelWithConn insert model data to database ans returns server init field values and
+ // primary keys.
+-func InsertModelWithConn(ctx context.Context, conn *pgx.Conn, model crudTypes.DbModel) (map[string]any, error) {
++func InsertModelWithConn(ctx context.Context, conn ds.Conn, model crudTypes.DbModel) (map[string]any, error) {
+ 	dbInsert := crudPg.NewPgInsert(model)
+ 	if err := crud.PrepareInsertModel(dbInsert); err != nil {
+ 		return nil, err
+@@ -43,17 +43,17 @@
+ 		logger.Logger.Debugf("InsertModel queryText: %s, params: %v", queryText, queryParams)
+ 	}
+ 
+-	if err := conn.QueryRow(ctx, queryText, queryParams...).Scan(dbInsert.RetFieldValues()...); err != nil && !errors.Is(err, pgx.ErrNoRows) {
++	if err := conn.QueryRow(ctx, queryText, queryParams...).Scan(dbInsert.RetFieldValues()...); err != nil && !errors.Is(err, ds.ErrNoRows) {
+ 		return nil, err
+ 	}
+ 
+ 	return dbInsert.RetFields(), nil
+ }
+ 
+-func DeleteModel(ctx context.Context, db *pgds.PgProvider, keyModels []crudTypes.DbModel) (int64, error) {
+-	poolConn, connID, err := db.GetPrimary()
+-	if err != nil {
+-		return 0, fmt.Errorf("GetPrimary() failed: %v", err)
++func DeleteModel(ctx context.Context, db ds.Provider, keyModels []crudTypes.DbModel) (int64, error) {
++	poolConn, connID, err := db.GetPrimary(ctx)
++	if err != nil {
++		return 0, fmt.Errorf("GetPrimary() failed: %w", err)
+ 	}
+ 	defer db.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -61,7 +61,7 @@
+ 	return DeleteModelWithConn(ctx, conn, keyModels)
+ }
+ 
+-func DeleteModelWithConn(ctx context.Context, conn *pgx.Conn, keyModels []crudTypes.DbModel) (int64, error) {
++func DeleteModelWithConn(ctx context.Context, conn ds.Conn, keyModels []crudTypes.DbModel) (int64, error) {
+ 	if len(keyModels) == 0 {
+ 		return 0, fmt.Errorf("delete array is empty")
+ 	}
+@@ -87,12 +87,12 @@
+ 	return cmd.RowsAffected(), err
+ }
+ 
+-func FetchModel(ctx context.Context, db *pgds.PgProvider,
++func FetchModel(ctx context.Context, db ds.Provider,
+ 	keyModel any, model crudTypes.DbModel,
+ ) error {
+-	poolConn, connID, err := db.GetSecondary("")
+-	if err != nil {
+-		return fmt.Errorf("GetSecondary() failed: %v", err)
++	poolConn, connID, err := db.GetSecondary(ctx, "")
++	if err != nil {
++		return fmt.Errorf("GetSecondary() failed: %w", err)
+ 	}
+ 	defer db.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -100,7 +100,7 @@
+ 	return FetchModelWithConn(ctx, conn, keyModel, model)
+ }
+ 
+-func FetchModelWithConn(ctx context.Context, conn *pgx.Conn,
++func FetchModelWithConn(ctx context.Context, conn ds.Conn,
+ 	keyModel any, model crudTypes.DbModel,
+ ) error {
+ 	filters := crudPg.PgFilters{}
+@@ -121,12 +121,12 @@
+ }
+ 
+ // FetchCollectionModel returns data model and aggregation model.
+-func FetchCollectionModel[T crudTypes.DbAggModel, U any](ctx context.Context, db *pgds.PgProvider,
++func FetchCollectionModel[T crudTypes.DbAggModel, U any](ctx context.Context, db ds.Provider,
+ 	model T, totModel *U, params crud.CollectionParams,
+ ) ([]T, *U, error) {
+-	poolConn, connID, err := db.GetSecondary("")
+-	if err != nil {
+-		return nil, nil, fmt.Errorf("GetSecondary() failed: %v", err)
++	poolConn, connID, err := db.GetSecondary(ctx, "")
++	if err != nil {
++		return nil, nil, fmt.Errorf("GetSecondary() failed: %w", err)
+ 	}
+ 	defer db.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -134,7 +134,7 @@
+ 	return FetchCollectionModelWithConn(ctx, conn, model, totModel, params)
+ }
+ 
+-func FetchCollectionModelWithConn[T crudTypes.DbAggModel, U any](ctx context.Context, conn *pgx.Conn,
++func FetchCollectionModelWithConn[T crudTypes.DbAggModel, U any](ctx context.Context, conn ds.Conn,
+ 	model T, totModel *U, params crud.CollectionParams,
+ ) ([]T, *U, error) {
+ 	// max limit if not defined in gui
+@@ -231,12 +231,12 @@
+ 	return dataModelResult, totModel, nil
+ }
+ 
+-func UpdateModel(ctx context.Context, db *pgds.PgProvider,
++func UpdateModel(ctx context.Context, db ds.Provider,
+ 	keyModel any, model crudTypes.DbModel,
+ ) (int64, error) {
+-	poolConn, connID, err := db.GetPrimary()
+-	if err != nil {
+-		return 0, fmt.Errorf("GetPrimary() failed: %v", err)
++	poolConn, connID, err := db.GetPrimary(ctx)
++	if err != nil {
++		return 0, fmt.Errorf("GetPrimary() failed: %w", err)
+ 	}
+ 	defer db.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -246,7 +246,7 @@
+ 
+ // UpdateModelWithConn update date in model table.
+ // It returns number of actually affected rows.
+-func UpdateModelWithConn(ctx context.Context, conn *pgx.Conn, keyModel any, model crudTypes.DbModel) (int64, error) {
++func UpdateModelWithConn(ctx context.Context, conn ds.Conn, keyModel any, model crudTypes.DbModel) (int64, error) {
+ 	dbUpdate := crudPg.NewPgUpdate(model)
+ 	if err := crud.PrepareUpdateModel(keyModel, dbUpdate); err != nil {
+ 		return 0, err
+@@ -338,9 +338,9 @@
+ }
+ 
+ func PublishEvent(ctx context.Context, sessionID string, eventID string, params string) error {
+-	poolConn, connID, err := database.DB.GetPrimary()
+-	if err != nil {
+-		return fmt.Errorf("GetPrimary() failed: %v", err)
++	poolConn, connID, err := database.DB.GetPrimary(ctx)
++	if err != nil {
++		return fmt.Errorf("GetPrimary() failed: %w", err)
+ 	}
+ 	defer database.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -348,14 +348,14 @@
+ 	return PublishEventWithConn(ctx, conn, sessionID, eventID, params)
+ }
+ 
+-func PublishEventWithConn(ctx context.Context, conn *pgx.Conn, sessionID string, eventID string, params string) error {
++func PublishEventWithConn(ctx context.Context, conn ds.Conn, sessionID string, eventID string, params string) error {
+ 	_, err := conn.Exec(ctx, `SELECT pg_notify($1, $2)`, eventID, params)
+ 	return err
+ }
+ 
+ */
+ 
+-func tryAdvisoryLock(ctx context.Context, conn *pgx.Conn, key int64) (bool, error) {
++func tryAdvisoryLock(ctx context.Context, conn ds.Conn, key int64) (bool, error) {
+ 	var locked bool
+ 	err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&locked)
+ 	if err != nil {
+@@ -364,7 +364,7 @@
+ 	return locked, nil
+ }
+ 
+-func unlock(ctx context.Context, conn *pgx.Conn, key int64) {
++func unlock(ctx context.Context, conn ds.Conn, key int64) {
+ 	_, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, key)
+ 	if err != nil {
+ 		logger.Logger.Warnf("Failed to release advisory lock: %v", err)
+--- a/services/vehicle.go
++++ b/services/vehicle.go
+@@ -10,22 +10,22 @@
+ 	"github.com/dronm/eurobeton/config"
+ 	"github.com/dronm/eurobeton/models"
+ 
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/session"
+ )
+ 
+ // VehicleService is a service for CementSilo database object.
+ type VehicleService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ 	QueryID string
+ }
+ 
+-func NewVehicleService(db *pgds.PgProvider, sess session.Session) *VehicleService {
++func NewVehicleService(db ds.Provider, sess session.Session) *VehicleService {
+ 	return &VehicleService{DB: db, Session: sess}
+ }
+ 
+-func (s *VehicleService) SetDB(db *pgds.PgProvider) {
++func (s *VehicleService) SetDB(db ds.Provider) {
+ 	s.DB = db
+ }
+ 
+--- a/services/vehicleSchedule.go
++++ b/services/vehicleSchedule.go
+@@ -4,22 +4,22 @@
+ 	"context"
+ 	"fmt"
+ 
+-	"github.com/dronm/ds/pgds"
++	"github.com/dronm/ds/v4"
+ 	"github.com/dronm/eurobeton/models"
+ 	"github.com/dronm/session"
+ )
+ 
+ type VehicleScheduleService struct {
+-	DB      *pgds.PgProvider
++	DB      ds.Provider
+ 	Session session.Session
+ 	QueryID string
+ }
+ 
+-func NewVehicleScheduleService(db *pgds.PgProvider, sess session.Session) *VehicleScheduleService {
++func NewVehicleScheduleService(db ds.Provider, sess session.Session) *VehicleScheduleService {
+ 	return &VehicleScheduleService{DB: db, Session: sess}
+ }
+ 
+-func (s *VehicleScheduleService) SetDB(db *pgds.PgProvider) {
++func (s *VehicleScheduleService) SetDB(db ds.Provider) {
+ 	s.DB = db
+ }
+ 
+@@ -32,9 +32,9 @@
+ }
+ 
+ func (s *VehicleScheduleService) ToKonkridDelete(ctx context.Context, model models.VehicleScheduleKey) error {
+-	poolConn, connID, err := s.DB.GetPrimary()
++	poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 	if err != nil {
+-		return fmt.Errorf("GetPrimary(): %v", err)
++		return fmt.Errorf("GetPrimary(): %w", err)
+ 	}
+ 	defer s.DB.Release(poolConn, connID)
+ 	conn := poolConn.Conn()
+@@ -77,9 +77,9 @@
+ 
+ func (s *VehicleScheduleService) ToKonkridUpsert(ctx context.Context, model models.VehicleScheduleKey) error {
+ 	/*
+-		poolConn, connID, err := s.DB.GetPrimary()
++		poolConn, connID, err := s.DB.GetPrimary(ctx)
+ 		if err != nil {
+-			return fmt.Errorf("GetPrimary(): %v", err)
++			return fmt.Errorf("GetPrimary(): %w", err)
+ 		}
+ 		defer s.DB.Release(poolConn, connID)
+ 		conn := poolConn.Conn()
+--- a/ws/handler.go
++++ b/ws/handler.go
+@@ -45,168 +45,168 @@
+ }
+ 
+ func (s *WSServer) HandleConnection(w http.ResponseWriter, r *http.Request, sess session.Session, c *gin.Context) (int, error) {
+-    conn, err := upgrader.Upgrade(w, r, nil)
+-    if err != nil {
+-        return http.StatusInternalServerError, fmt.Errorf("upgrader.Upgrade(): %v", err)
+-    }
+-
+-    clientID := sess.SessionID()
+-    logger.Logger.Warnf("WSServer HandleConnection: adding new client with ID: %s", clientID)
+-
+-    client := NewClient(clientID, conn, s.EventServer)
+-
+-    s.clientsMx.Lock()
+-    s.clients[clientID] = append(s.clients[clientID], client)
+-    s.clientsMx.Unlock()
+-
+-    defer func() {
+-        logger.Logger.Warnf("ws: closing connection %s, removing from session client list", clientID)
+-
+-        s.clientsMx.Lock()
+-        clients := s.clients[clientID]
+-        for i, c := range clients {
+-            if c == client {
+-                c.RemoveAllEvents()
+-                s.clients[clientID] = append(clients[:i], clients[i+1:]...)
+-                break
+-            }
+-        }
+-
+-        if len(s.clients[clientID]) == 0 {
+-            delete(s.clients, clientID)
+-        }
+-        s.clientsMx.Unlock()
+-
+-        conn.Close()
+-    }()
+-
+-    done := make(chan struct{})
+-    go func() {
+-        <-r.Context().Done()
+-        logger.Logger.Info("ws: request context closed, terminating connection")
+-        conn.Close()
+-        close(done)
+-    }()
+-
+-    for {
+-        select {
+-        case <-done:
+-            return http.StatusOK, nil
+-
+-        default:
+-            msgType, msg, err := conn.ReadMessage()
+-            if err != nil {
+-                if websocket.IsCloseError(err,
+-                    websocket.CloseNormalClosure,
+-                    websocket.CloseGoingAway,
+-                ) {
+-                    return http.StatusOK, nil
+-                }
+-                return http.StatusInternalServerError, fmt.Errorf("conn.ReadMessage(): %v", err)
+-            }
+-
+-            logger.Logger.Debugf("Received: type:%d, msg:%s\n", msgType, string(msg))
+-
+-            // update client visit time
+-            client.mx.Lock()
+-            client.VisitedAt = time.Now()
+-            client.mx.Unlock()
+-
+-            resp := SrvResponse{EventID: "Response"}
+-
+-            clientMsg := ClientMessage{}
+-            if err := json.Unmarshal(msg, &clientMsg); err != nil {
+-                resp.Error = NewSrvResponseError(
+-                    http.StatusInternalServerError,
+-                    "json.Unmarshal client message",
+-                    s.IsProduction, err,
+-                )
+-                _ = s.SendMessage(client, &resp)
+-                continue
+-            }
+-
+-            if clientMsg.Func == "" {
+-                resp.Error = NewSrvResponseError(
+-                    http.StatusInternalServerError,
+-                    "func is not defined",
+-                    s.IsProduction, nil,
+-                )
+-                _ = s.SendMessage(client, &resp)
+-                continue
+-            }
+-
+-            // Service.Method
+-            service := strings.Split(clientMsg.Func, ".")
+-            if len(service) != 2 {
+-                resp.Error = NewSrvResponseError(
+-                    http.StatusInternalServerError,
+-                    "func structure is bad",
+-                    s.IsProduction, nil,
+-                )
+-                _ = s.SendMessage(client, &resp)
+-                continue
+-            }
+-
+-            params, err := api.UnmarshalParams(clientMsg.Payload)
+-            if err != nil {
+-                resp.Error = NewSrvResponseError(
+-                    http.StatusInternalServerError,
+-                    "api.UnmarshalParams",
+-                    s.IsProduction, err,
+-                )
+-                _ = s.SendMessage(client, &resp)
+-                continue
+-            }
+-
+-            // permission check
+-            if s.isMethodAllowed != nil {
+-                if err := s.isMethodAllowed(sess, service[0]+service[1]); err != nil {
+-                    conn.WriteMessage(
+-                        websocket.CloseMessage,
+-                        websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "method is not allowed"),
+-                    )
+-                    return http.StatusUnauthorized,
+-                        fmt.Errorf("isMethodAllowed(%s.%s)", service[0], service[1])
+-                }
+-            }
+-
+-            methDuration := defMaxMethodCallDuration
+-            if s.MaxMethodCallDuration != 0 {
+-                methDuration = s.MaxMethodCallDuration
+-            }
+-            ctx, cancel := context.WithTimeout(context.Background(), methDuration)
+-
+-            var resHTTP int
+-            resHTTP, resp.Payload, err = controllers.CallServiceMethod(
+-                ctx,
+-                service[0],
+-                service[1],
+-                params,
+-                &api.ServiceContext{
+-                    DB:      database.DB,
+-                    Session: sess,
+-                    QueryID: clientMsg.QueryID,
+-                },
+-            )
+-
+-            if err != nil {
+-                resp.Error = NewSrvResponseError(
+-                    resHTTP,
+-                    "controllers.CallServiceMethod",
+-                    s.IsProduction, err,
+-                )
+-                _ = s.SendMessage(client, &resp)
+-                cancel()
+-                continue
+-            }
+-
+-            if resp.Payload != nil {
+-                if err := s.SendMessage(client, &resp); err != nil {
+-                    logger.Logger.Errorf("error sending response: %v", err)
+-                }
+-            }
+-
+-            cancel()
+-        }
+-    }
+-}
++	conn, err := upgrader.Upgrade(w, r, nil)
++	if err != nil {
++		return http.StatusInternalServerError, fmt.Errorf("upgrader.Upgrade(): %v", err)
++	}
++
++	clientID := sess.SessionID()
++	logger.Logger.Warnf("WSServer HandleConnection: adding new client with ID: %s", clientID)
++
++	client := NewClient(clientID, conn, s.EventServer)
++
++	s.clientsMx.Lock()
++	s.clients[clientID] = append(s.clients[clientID], client)
++	s.clientsMx.Unlock()
++
++	defer func() {
++		logger.Logger.Warnf("ws: closing connection %s, removing from session client list", clientID)
++
++		s.clientsMx.Lock()
++		clients := s.clients[clientID]
++		for i, c := range clients {
++			if c == client {
++				c.RemoveAllEvents()
++				s.clients[clientID] = append(clients[:i], clients[i+1:]...)
++				break
++			}
++		}
++
++		if len(s.clients[clientID]) == 0 {
++			delete(s.clients, clientID)
++		}
++		s.clientsMx.Unlock()
++
++		conn.Close()
++	}()
++
++	done := make(chan struct{})
++	go func() {
++		<-r.Context().Done()
++		logger.Logger.Info("ws: request context closed, terminating connection")
++		conn.Close()
++		close(done)
++	}()
++
++	for {
++		select {
++		case <-done:
++			return http.StatusOK, nil
++
++		default:
++			msgType, msg, err := conn.ReadMessage()
++			if err != nil {
++				if websocket.IsCloseError(err,
++					websocket.CloseNormalClosure,
++					websocket.CloseGoingAway,
++				) {
++					return http.StatusOK, nil
++				}
++				return http.StatusInternalServerError, fmt.Errorf("conn.ReadMessage(): %v", err)
++			}
++
++			logger.Logger.Debugf("Received: type:%d, msg:%s\n", msgType, string(msg))
++
++			// update client visit time
++			client.mx.Lock()
++			client.VisitedAt = time.Now()
++			client.mx.Unlock()
++
++			resp := SrvResponse{EventID: "Response"}
++
++			clientMsg := ClientMessage{}
++			if err := json.Unmarshal(msg, &clientMsg); err != nil {
++				resp.Error = NewSrvResponseError(
++					http.StatusInternalServerError,
++					"json.Unmarshal client message",
++					s.IsProduction, err,
++				)
++				_ = s.SendMessage(client, &resp)
++				continue
++			}
++
++			if clientMsg.Func == "" {
++				resp.Error = NewSrvResponseError(
++					http.StatusInternalServerError,
++					"func is not defined",
++					s.IsProduction, nil,
++				)
++				_ = s.SendMessage(client, &resp)
++				continue
++			}
++
++			// Service.Method
++			service := strings.Split(clientMsg.Func, ".")
++			if len(service) != 2 {
++				resp.Error = NewSrvResponseError(
++					http.StatusInternalServerError,
++					"func structure is bad",
++					s.IsProduction, nil,
++				)
++				_ = s.SendMessage(client, &resp)
++				continue
++			}
++
++			params, err := api.UnmarshalParams(clientMsg.Payload)
++			if err != nil {
++				resp.Error = NewSrvResponseError(
++					http.StatusInternalServerError,
++					"api.UnmarshalParams",
++					s.IsProduction, err,
++				)
++				_ = s.SendMessage(client, &resp)
++				continue
++			}
++
++			// permission check
++			if s.isMethodAllowed != nil {
++				if err := s.isMethodAllowed(sess, service[0]+service[1]); err != nil {
++					conn.WriteMessage(
++						websocket.CloseMessage,
++						websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "method is not allowed"),
++					)
++					return http.StatusUnauthorized,
++						fmt.Errorf("isMethodAllowed(%s.%s)", service[0], service[1])
++				}
++			}
++
++			methDuration := defMaxMethodCallDuration
++			if s.MaxMethodCallDuration != 0 {
++				methDuration = s.MaxMethodCallDuration
++			}
++			ctx, cancel := context.WithTimeout(r.Context(), methDuration)
++
++			var resHTTP int
++			resHTTP, resp.Payload, err = controllers.CallServiceMethod(
++				ctx,
++				service[0],
++				service[1],
++				params,
++				&api.ServiceContext{
++					DB:      database.DB,
++					Session: sess,
++					QueryID: clientMsg.QueryID,
++				},
++			)
++
++			if err != nil {
++				resp.Error = NewSrvResponseError(
++					resHTTP,
++					"controllers.CallServiceMethod",
++					s.IsProduction, err,
++				)
++				_ = s.SendMessage(client, &resp)
++				cancel()
++				continue
++			}
++
++			if resp.Payload != nil {
++				if err := s.SendMessage(client, &resp); err != nil {
++					logger.Logger.Errorf("error sending response: %v", err)
++				}
++			}
++
++			cancel()
++		}
++	}
++}

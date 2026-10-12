@@ -1,0 +1,15 @@
+package app
+
+import (
+	md "github.com/dronm/crudifier/metadata"
+)
+
+func InitEnums() {
+	md.Enums = map[string][]string{
+		"locales":    {"ru"},
+		"role_types": {
+			"owner", "boss", "manager", "operator", "dispatcher", "lab_worker", 
+			"supplier", "sales", "client", "weighing",
+		},
+	}
+}
